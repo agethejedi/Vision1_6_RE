@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>RiskXLabs — Vision</title>
+  <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml"/>
+  <link rel="stylesheet" href="./styles.css"/>
+  <script type="module" src="./config.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="favicon" src="./assets/favicon.svg" alt="" />
+      <span class="brand-text">Risk<span class="brand-x">X</span>Labs Vision</span>
+    </div>
+    <nav class="nav">
+      <button id="refreshBtn" class="btn">Refresh View</button>
+      <select id="networkSelect" class="select">
+        <option value="eth" selected>Ethereum</option>
+        <option value="polygon">Polygon</option>
+        <option value="arbitrum">Arbitrum</option>
+      </select>
+    </nav>
+  </header>
+
+  <main class="layout">
+    <section class="left">
+      <div class="panel">
+        <h3 class="panel-title">Graph</h3>
+        <canvas id="graphCanvas" width="1080" height="720" aria-label="Network graph"></canvas>
+        <div class="panel-row">
+          <input id="seedInput" class="input" placeholder="Seed address (0x…)" />
+          <button id="loadSeedBtn" class="btn">Load</button>
+          <button id="clearBtn" class="btn btn-ghost">Clear</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="right">
+      <div class="panel">
+        <h3 class="panel-title">Details</h3>
+        <rx-score id="scorePanel" size="200"></rx-score>
+        <div id="entityMeta" class="meta"></div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">Batch Status</h3>
+        <div id="batchStatus" class="meta">Idle</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>© RiskXLabs — We Fight Fraud</span>
+  </footer>
+
+  <script type="module" src="./ui/ScoreMeter.js"></script>
+  <script type="module" src="./cache/lru.js"></script>
+  <script type="module" src="./adapters/evm.js"></script>
+  <script type="module" src="./graph.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "riskxlabs-vision",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "http-server ./vision -c-1 -p 5173",
+    "serve": "http-server ./vision -c-1 -p 5173"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}
