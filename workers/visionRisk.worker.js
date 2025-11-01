@@ -1,8 +1,8 @@
 import { scoreOne, scoreBatch } from '../shared/risk-core/index.js';
-import { RiskAdapters } from '../adapters/evm.js'; // ← import adapter inside worker
+import { RiskAdapters } from '../adapters/evm.js'; // import adapter INSIDE the worker
 
 let ctx = {
-  adapters: { evm: RiskAdapters.evm }, // ← keep adapter here
+  adapters: { evm: RiskAdapters.evm }, // keep adapter here (don’t pass from main thread)
   cache: null,
   network: 'eth',
   ruleset: 'safesend-2025.10.1',
@@ -14,9 +14,13 @@ self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
   try {
     if (type === 'INIT') {
-      // Don't allow adapters to be overwritten by payload (avoids cloning functions)
-      const { adapters: _ignored, ...rest } = payload || {};
+      const { adapters: _ignored, apiBase, ...rest } = payload || {};
+      // Keep our adapter, merge other settings
       ctx = { ...ctx, ...rest };
+      // Provide VisionConfig to the worker scope for the adapter to read
+      if (apiBase) {
+        self.VisionConfig = Object.assign({}, self.VisionConfig || {}, { API_BASE: apiBase });
+      }
       postMessage({
         id,
         type: 'INIT_OK',
