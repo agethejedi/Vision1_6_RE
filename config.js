@@ -1,6 +1,6 @@
 // Vision config using existing X-Wallet worker as backend
 export const VisionConfig = {
-  API_BASE: "xwalletv1dot2.agedotcom.workers.dev",  // Replace with your deployed X-Wallet worker endpoint
+  API_BASE: "https://xwalletv1dot2.agedotcom.workers.dev",  // Replace with your deployed X-Wallet worker endpoint
   NETWORKS: {
     eth: { label: "Ethereum" },
     polygon: { label: "Polygon" },
