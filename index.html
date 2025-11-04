@@ -63,6 +63,46 @@
         <div id="entityMeta" class="meta"></div>
       </div>
 
+      <!-- ===================== NEW: Narrative Summary panel ===================== -->
+      <div class="panel" id="narrativePanel" hidden>
+        <h3 class="panel-title">Narrative Summary</h3>
+
+        <!-- Mode + actions -->
+        <div class="panel-row" style="gap:8px; align-items:center;">
+          <label for="rxlMode" class="muted" style="min-width:90px;">Mode</label>
+          <select id="rxlMode" class="select">
+            <option value="analyst" selected>Analyst</option>
+            <option value="consumer">Consumer</option>
+          </select>
+          <div style="margin-left:auto; display:flex; gap:8px;">
+            <button id="rxlCopy" class="btn btn-ghost">Copy</button>
+            <button id="rxlExport" class="btn btn-ghost">Export PDF</button>
+          </div>
+        </div>
+
+        <!-- Narrative text -->
+        <p id="rxlNarrativeText" class="meta"></p>
+
+        <!-- Badges -->
+        <div id="rxlBadges" class="badge-row" aria-label="Risk badges"></div>
+
+        <!-- Factor table -->
+        <div class="table-wrap" style="margin-top:8px;">
+          <table id="rxlFactors" class="table">
+            <thead>
+              <tr>
+                <th>Factor</th>
+                <th>Metric(s)</th>
+                <th style="text-align:right;">Impact</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody><!-- rows injected by app.js --></tbody>
+          </table>
+        </div>
+      </div>
+      <!-- =================== /NEW: Narrative Summary panel ====================== -->
+
       <div class="panel">
         <h3 class="panel-title">Batch Status</h3>
         <div id="batchStatus" class="meta">Idle</div>
