@@ -3,7 +3,7 @@ import './graph.js?v=2025-11-02';             // provides window.graph (on/setDa
 
 /* ================= RXL FLAGS (safe defaults) ==================== */
 const RXL_FLAGS = Object.freeze({
-  enableNarrative: true   // flip off to hide the Narrative panel entirely
+  enableNarrative: true  // flip false to hide Narrative panel entirely
 });
 
 /* ================= Worker plumbing ============================== */
@@ -63,53 +63,46 @@ worker.onmessage = (e) => {
 };
 
 /* ================ Result normalization ========================== */
-// Normalize worker result → trust server-side policy if present
 function normalizeResult(res = {}) {
-  // Score: prefer server risk_score (100 on OFAC), else fallback to res.score
+  // Prefer server risk_score (100 on OFAC), else fallback to res.score
   const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
   const score = (serverScore != null) ? serverScore : (typeof res.score === 'number' ? res.score : 0);
 
   // Blocked if server says block, or risk_score=100, or explicit sanction hit
   const blocked = !!(res.block || serverScore === 100 || res.sanctionHits);
 
-  // Preserve any upstream explain; otherwise create a minimal shell
+  // Preserve upstream explain or create a shell
   const explain = res.explain && typeof res.explain === 'object'
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // Ensure the narrative layer can find basic booleans
-  explain.ofacHit = !!(res.sanctionHits || explain.ofacHit);
+  // Robust OFAC boolean for UI/badges
+  coerceOfacFlag(explain, res);
 
-  // Try to supply walletAgeRisk from feats if upstream didn't include it
-  // feats.ageDays → walletAgeRisk heuristic (you can replace when worker emits it natively)
+  // Wallet age risk (fallback from feats.ageDays → 0..1; younger = riskier)
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(res.feats?.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
-      // Younger → higher risk: 0 at 2y+, ~0.5 at 1y, ~0.8 at 3m, ~1 at brand new
       explain.walletAgeRisk = clamp(1 - Math.min(1, days / (365 * 2)));
     }
   }
 
-  // Map any existing local/neighbor heuristics into a narrative-friendly shape (best-effort)
-  // If/when the worker returns neighborsDormant / neighborsAvgTxCount / neighborsAvgAge, we’ll prefer those.
+  // Map any neighbor proxies if native fields absent
   if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     explain.neighborsDormant = {
-      inactiveRatio: clamp(r),         // proxy until we compute real dormant ratio
-      avgInactiveAge: null,            // unknown at this layer (worker upgrade later)
-      resurrected: 0,                  // unknown
-      whitelistPct: 0,                 // unknown
+      inactiveRatio: clamp(r),
+      avgInactiveAge: null,
+      resurrected: 0,
+      whitelistPct: 0,
       n: null
     };
   }
-
   if (!explain.neighborsAvgTxCount && res.feats?.local?.neighborAvgTx != null) {
     explain.neighborsAvgTxCount = { avgTx: Number(res.feats.local.neighborAvgTx) || 0, n: null };
   }
-
   if (!explain.neighborsAvgAge && res.feats?.local?.neighborAvgAgeDays != null) {
-    const avgDays = Number(res.feats.local.neighborAvgAgeDays) || 0;
-    explain.neighborsAvgAge = { avgDays, n: null };
+    explain.neighborsAvgAge = { avgDays: Number(res.feats.local.neighborAvgAgeDays) || 0, n: null };
   }
 
   return {
@@ -129,7 +122,7 @@ async function init() {
     network: getNetwork(),
     ruleset: 'safesend-2025.10.1',
     concurrency: 8,
-    flags: { graphSignals: true, streamBatch: true }
+    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // neighborStats is safe if worker ignores it
   });
 
   bindUI();
@@ -194,7 +187,7 @@ function bindUI() {
   const exportBtn = document.getElementById('rxlExport');
   if (exportBtn) {
     exportBtn.addEventListener('click', () => {
-      // Stub: hook into your existing export util
+      // Hook into your export util if desired:
       // exportRiskNarrativePDF({ result: lastRenderResult, narrative: document.getElementById('rxlNarrativeText')?.textContent || '' });
       flash(exportBtn, 'Queued');
     });
@@ -224,12 +217,7 @@ function updateScorePanel(res) {
   const ageDays = Number(feats.ageDays ?? 0);
   let ageDisplay = '—';
   if (ageDays > 0) {
-    const totalMonths = Math.round(ageDays / 30.44); // avg days / month
-    const years = Math.floor(totalMonths / 12);
-    const months = totalMonths % 12;
-    if (years > 0 && months > 0) ageDisplay = `${years}y ${months}m`;
-    else if (years > 0) ageDisplay = `${years}y`;
-    else ageDisplay = `${months}m`;
+    ageDisplay = fmtAgeDays(ageDays);
   }
 
   // ----- Inject default factor weights if none provided -----
@@ -266,10 +254,10 @@ function updateScorePanel(res) {
 
 /* ================= Graph halo ================================== */
 function drawHalo(res) {
-  // If you want “blocked = always red” use graph.setHalo(res) directly:
+  // “blocked = red” handled inside graph.setHalo(res) if your graph module honors blocked
   window.graph?.setHalo(res);
 
-  // If you still want custom ring color by score for non-blocked cases, you can keep this:
+  // If you still want custom ring color by score for non-blocked cases, keep this as reference
   // const color = res.score >= 80 ? '#ff3b3b'
   //            : res.score >= 60 ? '#ffb020'
   //            : res.score >= 40 ? '#ffc857'
@@ -319,18 +307,24 @@ function loadSeed(seed) {
 }
 
 /* ================= Narrative Engine v1 =========================== */
-// Stateless builder using either res.explain.* (preferred) or res.feats.* (fallback)
+let lastRenderResult = null;
+
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
+
+  // Nice age for phrasing (use last render result feats if available)
+  const daysForNice = typeof lastRenderResult?.feats?.ageDays === 'number'
+    ? lastRenderResult.feats.ageDays : null;
+  const niceAge = daysForNice != null ? fmtAgeDays(daysForNice) : null;
 
   // Age posture
   const ageRisk = Number(expl.walletAgeRisk ?? NaN);
   if (!Number.isNaN(ageRisk)) {
-    if (ageRisk >= 0.6) parts.push('newly created');
-    else if (ageRisk <= 0.2) parts.push('long-standing');
+    if (ageRisk >= 0.6) parts.push(niceAge ? `newly created (${niceAge})` : 'newly created');
+    else if (ageRisk <= 0.2) parts.push(niceAge ? `long-standing (${niceAge})` : 'long-standing');
   }
 
-  // Dormant neighbors (preferred path)
+  // Dormant neighbors
   const dorm = expl.neighborsDormant || {};
   if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) {
     let bit = 'connected to multiple dormant aged wallets';
@@ -374,18 +368,15 @@ function narrativeFromExplain(expl, mode = 'analyst') {
   return { text, badges, factors };
 }
 
-// Render into panel if enabled and panel exists
-let lastRenderResult = null;
-
 function renderNarrativePanelIfEnabled(res) {
   lastRenderResult = res;
   if (!RXL_FLAGS.enableNarrative) return;
   const panel = document.getElementById('narrativePanel');
   if (!panel) return;
 
-  // Build a hybrid explain (prefer res.explain)
   const expl = res.explain || {};
-  // Best-effort backfill from feats if explain is sparse (so v1 works now)
+
+  // Backfill neighbors from feats if needed (so v1 works before worker upgrade)
   if (!expl.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     expl.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
@@ -402,7 +393,6 @@ function renderNarrativePanelIfEnabled(res) {
   const mode = modeSel ? modeSel.value : 'analyst';
   const { text, badges, factors } = narrativeFromExplain(expl, mode);
 
-  // Unhide and populate
   panel.hidden = false;
 
   const textEl = document.getElementById('rxlNarrativeText');
@@ -460,7 +450,6 @@ function deriveMetrics(res, key){
         return `inactiveRatio ${(d.inactiveRatio*100).toFixed(1)}%` +
                (d.avgInactiveAge ? `, avgAge ${Math.round(d.avgInactiveAge)}d` : '');
       }
-      // fallback proxy from feats.local.riskyNeighborRatio
       const r = res.feats?.local?.riskyNeighborRatio;
       return (typeof r === 'number') ? `proxyRatio ${(r*100).toFixed(1)}%` : '—';
     }
@@ -473,11 +462,8 @@ function deriveMetrics(res, key){
       return (typeof v === 'number') ? `avgDays ${Math.round(v)}` : '—';
     }
     case 'walletAgeRisk': {
-      const d = res.feats?.ageDays;
-      const r = e.walletAgeRisk;
-      if (typeof r === 'number') return `risk ${r.toFixed(2)}` + (typeof d === 'number' ? ` (${Math.round(d)}d)` : '');
-      if (typeof d === 'number') return `${Math.round(d)}d`;
-      return '—';
+      const days = typeof res.feats?.ageDays === 'number' ? res.feats.ageDays : null;
+      return days != null ? fmtAgeDays(days) : '—'; // match Details format
     }
     case 'ofacHit':
       return (res.sanctionHits || e.ofacHit) ? 'hit' : 'none';
@@ -496,8 +482,33 @@ function badgeClass(level){
 
 /* ================= Utilities ==================================== */
 function clamp(x, a=0, b=1){ return Math.max(a, Math.min(b, x)); }
+
+function fmtAgeDays(days){
+  if(!(days > 0)) return '—';
+  const totalMonths = Math.round(days / 30.44);
+  const y = Math.floor(totalMonths / 12);
+  const m = totalMonths % 12;
+  if (y > 0 && m > 0) return `${y}y ${m}m`;
+  if (y > 0) return `${y}y`;
+  return `${m}m`;
+}
+
 function flash(btn, msg){
   const keep = btn.textContent;
   btn.textContent = msg;
   setTimeout(()=>btn.textContent = keep, 900);
+}
+
+function hasReason(res, kw){
+  const arr = res.reasons || res.risk_factors || [];
+  const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
+  return txt.includes(kw);
+}
+function coerceOfacFlag(explain, res){
+  const hit = !!(
+    res.sanctionHits || res.sanctioned || res.ofac ||
+    hasReason(res, 'ofac') || hasReason(res, 'sanction')
+  );
+  explain.ofacHit = hit;
+  return hit;
 }
