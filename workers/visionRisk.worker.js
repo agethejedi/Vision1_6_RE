@@ -37,14 +37,24 @@ self.onmessage = async (e) => {
       return;
     }
 
-    // NEW: live neighbor graph (replies with type RESULT so app.js resolves)
+    // Live neighbor graph (replies with type RESULT so app.js resolves)
     if (type === 'NEIGHBORS') {
       const addr = (payload?.id || payload?.address || '').toLowerCase();
       const network = payload?.network || CFG.network || 'eth';
       const hop = Number(payload?.hop ?? 1) || 1;
       const limit = Number(payload?.limit ?? 250) || 250;
 
-      const data = await fetchNeighbors(addr, network, { hop, limit }).catch(() => stubNeighbors(addr));
+      let data;
+      try {
+        data = await fetchNeighbors(addr, network, { hop, limit });
+        // If API exists but returns empty/invalid, fall back to stub so UI still works
+        if (!data || !Array.isArray(data.nodes) || !data.nodes.length) {
+          data = stubNeighbors(addr);
+        }
+      } catch {
+        data = stubNeighbors(addr);
+      }
+
       post({ id, type: 'RESULT', data });
       return;
     }
@@ -125,10 +135,9 @@ async function scoreOne(item) {
 async function fetchNeighbors(address, network, { hop=1, limit=250 } = {}){
   if (!CFG.apiBase) return stubNeighbors(address);
 
-  // Try canonical /neighbors route
   const url = `${CFG.apiBase}/neighbors?address=${encodeURIComponent(address)}&network=${encodeURIComponent(network)}&hop=${hop}&limit=${limit}`;
   const r = await fetch(url, { headers: { 'accept':'application/json' }, cf:{ cacheTtl: 0 } });
-  if (!r.ok) return stubNeighbors(address);
+  if (!r.ok) return stubNeighbors(address);     // 404/500 → stub
   const raw = await r.json().catch(()=> ({}));
 
   // Normalize to {nodes:[{id}], links:[{a,b,weight}]}
@@ -152,7 +161,6 @@ async function fetchNeighbors(address, network, { hop=1, limit=250 } = {}){
 
   // Some APIs return an edge list and a distinct "center" node
   if (!nodes.length && Array.isArray(raw)) {
-    // Try to infer nodes from links array-of-arrays or objects
     const set = new Set();
     for (const L of raw) {
       const a = String(L?.a ?? L?.source ?? L?.from ?? L?.idA ?? '').toLowerCase();
