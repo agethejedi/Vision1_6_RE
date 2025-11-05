@@ -1,12 +1,15 @@
+// app.js — Vision 1_4: Dynamic factors + unified visuals + interactive refresh
+// ---------------------------------------------------------------------------
 import './ui/ScoreMeter.js?v=2025-11-02';     // provides window.ScoreMeter(...)
 import './graph.js?v=2025-11-02';             // provides window.graph (on/setData/setHalo)
 
-/* ================= RXL FLAGS (safe defaults) ==================== */
+/* ================= Feature Flags ==================== */
 const RXL_FLAGS = Object.freeze({
-  enableNarrative: true  // flip false to hide Narrative panel entirely
+  enableNarrative: true,           // flip false to hide Narrative panel
+  debounceViewportMs: 200,         // rescore delay after viewport changes (if event supported)
 });
 
-/* ================= Worker plumbing ============================== */
+/* ================= Worker plumbing ================== */
 const worker = new Worker('./workers/visionRisk.worker.js', { type: 'module' });
 
 const pending = new Map();
@@ -32,6 +35,7 @@ worker.onmessage = (e) => {
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
+      applyVisualCohesion(r);                 // NEW: unify ring & halo color
       renderNarrativePanelIfEnabled(r);
     }
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
@@ -43,6 +47,7 @@ worker.onmessage = (e) => {
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
+      applyVisualCohesion(r);                 // NEW
       renderNarrativePanelIfEnabled(r);
     }
     if (req) { req.resolve(r); pending.delete(id); }
@@ -87,7 +92,7 @@ function normalizeResult(res = {}) {
     }
   }
 
-  // Map any neighbor proxies if native fields absent
+  // Map any neighbor proxies if native fields absent (harmless if missing)
   if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     explain.neighborsDormant = {
@@ -122,7 +127,7 @@ async function init() {
     network: getNetwork(),
     ruleset: 'safesend-2025.10.1',
     concurrency: 8,
-    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // neighborStats is safe if worker ignores it
+    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // safe if worker ignores
   });
 
   bindUI();
@@ -154,7 +159,7 @@ function bindUI() {
     scoreVisible();
   });
 
-  // Graph selection → score and render
+  // Graph selection → score and render (context refresh)
   window.graph?.on('selectNode', (n) => {
     if (!n) return;
     setSelected(n.id);
@@ -162,10 +167,19 @@ function bindUI() {
       .then(r => {
         const rr = normalizeResult(r);
         updateScorePanel(rr);
+        applyVisualCohesion(rr);             // NEW: unify visuals on selection
         renderNarrativePanelIfEnabled(rr);
       })
       .catch(() => {});
   });
+
+  // Optional: rescore visible when viewport changes (if graph emits it)
+  if (typeof window.graph?.on === 'function') {
+    window.graph.on('viewportChanged', () => {
+      clearTimeout(window.__RXL_VP_T__);
+      window.__RXL_VP_T__ = setTimeout(scoreVisible, RXL_FLAGS.debounceViewportMs);
+    });
+  }
 
   // Narrative UI actions (exist only if panel is present in index.html)
   const modeSel = document.getElementById('rxlMode');
@@ -178,16 +192,12 @@ function bindUI() {
   if (copyBtn) {
     copyBtn.addEventListener('click', async () => {
       const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
-      try {
-        await navigator.clipboard.writeText(txt);
-        flash(copyBtn, 'Copied!');
-      } catch {}
+      try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
     });
   }
   const exportBtn = document.getElementById('rxlExport');
   if (exportBtn) {
     exportBtn.addEventListener('click', () => {
-      // Hook into your export util if desired:
       // exportRiskNarrativePDF({ result: lastRenderResult, narrative: document.getElementById('rxlNarrativeText')?.textContent || '' });
       flash(exportBtn, 'Queued');
     });
@@ -201,6 +211,32 @@ function getNetwork() {
 let selectedNodeId = null;
 function setSelected(id) { selectedNodeId = id; }
 
+/* ================= Factor Weights + Builders ==================== */
+const FACTOR_WEIGHTS = {
+  'OFAC': 40,
+  'OFAC/sanctions list match': 40,
+  'sanctioned Counterparty': 40,
+  'fan In High': 9,
+  'shortest Path To Sanctioned': 6,
+  'burst Anomaly': 0,
+  'known Mixer Proximity': 0,
+};
+
+function computeBreakdownFrom(res){
+  if (Array.isArray(res.breakdown) && res.breakdown.length) return res.breakdown;
+  const src = res.reasons || res.risk_factors || [];
+  if (!Array.isArray(src) || !src.length) return [];
+  const list = src.map(label => ({
+    label: String(label),
+    delta: FACTOR_WEIGHTS[label] ?? 0
+  }));
+  const hasSanctionRef = list.some(x => /sanction|ofac/i.test(x.label));
+  if ((res.block || res.blocked || res.risk_score === 100) && !hasSanctionRef) {
+    list.unshift({ label: 'sanctioned Counterparty', delta: 40 });
+  }
+  return list.sort((a,b)=> (b.delta||0)-(a.delta||0));
+}
+
 /* ================= Score panel instance ========================= */
 const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
   setSummary(){}, setScore(){}, setBlocked(){}, setReasons(){}, getScore(){ return 0; }
@@ -212,34 +248,22 @@ function updateScorePanel(res) {
     ? res.parity
     : 'SafeSend parity';
 
-  // ----- AGE (convert from days → years + months) -----
+  // ---- Age (years/months) ----
   const feats = res.feats || {};
   const ageDays = Number(feats.ageDays ?? 0);
-  let ageDisplay = '—';
-  if (ageDays > 0) {
-    ageDisplay = fmtAgeDays(ageDays);
-  }
+  const ageDisplay = (ageDays > 0) ? fmtAgeDays(ageDays) : '—';
 
-  // ----- Inject default factor weights if none provided -----
-  const defaultBreakdown = [
-    { label: 'sanctioned Counterparty', delta: 40 },
-    { label: 'fan In High', delta: 9 },
-    { label: 'shortest Path To Sanctioned', delta: 6 },
-    { label: 'burst Anomaly', delta: 0 },
-    { label: 'known Mixer Proximity', delta: 0 }
-  ];
-  if (!Array.isArray(res.breakdown) || res.breakdown.length === 0) {
-    res.breakdown = defaultBreakdown;
-  }
+  // ---- Dynamic factor list (no static defaults) ----
+  res.breakdown = computeBreakdownFrom(res);
 
-  // ----- Keep numeric score even when blocked -----
+  // ---- Keep numeric score even when blocked ----
   const blocked = !!(res.block || res.risk_score === 100 || res.sanctionHits);
   res.blocked = blocked;
 
-  // Render the new unified card
+  // Render the unified card
   scorePanel.setSummary(res);
 
-  // ----- Meta summary section -----
+  // ---- Meta summary ----
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
   const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
 
@@ -252,20 +276,37 @@ function updateScorePanel(res) {
   `;
 }
 
-/* ================= Graph halo ================================== */
-function drawHalo(res) {
-  // “blocked = red” handled inside graph.setHalo(res) if your graph module honors blocked
-  window.graph?.setHalo(res);
-
-  // If you still want custom ring color by score for non-blocked cases, keep this as reference
-  // const color = res.score >= 80 ? '#ff3b3b'
-  //            : res.score >= 60 ? '#ffb020'
-  //            : res.score >= 40 ? '#ffc857'
-  //            : res.score >= 20 ? '#22d37b'
-  //            : '#00eec3';
-  // window.graph?.setHalo(res.id, { intensity: res.score / 100, color, tooltip: res.label });
+/* ================= Unified visuals (halo + ring) ================ */
+function colorForScore(score, blocked){
+  if (blocked) return '#ef4444';           // hard red for blocked
+  if (score >= 80) return '#ff3b3b';
+  if (score >= 60) return '#ffb020';
+  if (score >= 40) return '#ffc857';
+  if (score >= 20) return '#22d37b';
+  return '#00eec3';
 }
 
+function applyVisualCohesion(res){
+  const color = colorForScore(res.score || 0, !!res.blocked);
+  // Graph halo with intensity ~ score
+  window.graph?.setHalo({
+    id: res.id,
+    color,
+    intensity: Math.max(0.25, (res.score||0)/100),
+    blocked: !!res.blocked
+  });
+  // Score ring color via CSS var on the panel root
+  const panel = document.getElementById('scorePanel');
+  if (panel) panel.style.setProperty('--ring-color', color);
+}
+
+/* ================= Graph halo (fallback) ======================== */
+function drawHalo(res) {
+  // Keep original behavior; applyVisualCohesion will override color/intensity
+  window.graph?.setHalo(res);
+}
+
+/* ================= Status line (Batch Status) =================== */
 function updateBatchStatus(text) {
   const el = document.getElementById('batchStatus');
   if (el) el.textContent = text;
@@ -360,7 +401,7 @@ function narrativeFromExplain(expl, mode = 'analyst') {
   if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
-  // Factors (use upstream deltas if present)
+  // Factors: prefer worker-provided explain factorImpacts, else none (we'll inject res.breakdown later)
   const factors = Array.isArray(expl.factorImpacts)
     ? [...expl.factorImpacts].sort((a,b)=>(b.delta||0)-(a.delta||0)).slice(0,5)
     : [];
@@ -376,7 +417,7 @@ function renderNarrativePanelIfEnabled(res) {
 
   const expl = res.explain || {};
 
-  // Backfill neighbors from feats if needed (so v1 works before worker upgrade)
+  // Backfill neighbors from feats if needed (pre-worker-upgrade support)
   if (!expl.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     expl.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
@@ -391,7 +432,14 @@ function renderNarrativePanelIfEnabled(res) {
 
   const modeSel = document.getElementById('rxlMode');
   const mode = modeSel ? modeSel.value : 'analyst';
-  const { text, badges, factors } = narrativeFromExplain(expl, mode);
+  let { text, badges, factors } = narrativeFromExplain(expl, mode);
+
+  // If no factors from explain, use the dynamic res.breakdown (top 5)
+  if ((!factors || !factors.length) && Array.isArray(res.breakdown)) {
+    factors = res.breakdown.slice(0,5).map(x => ({
+      label: x.label, delta: x.delta, sourceKey: 'breakdown'
+    }));
+  }
 
   panel.hidden = false;
 
