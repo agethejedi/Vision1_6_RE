@@ -1,4 +1,4 @@
-// app.js — Vision 1_4.2 (neighbors + stats + controls, syntax-safe)
+// app.js — Vision 1_4.3 (neighbors + stats + narrative + controls)
 import './ui/ScoreMeter.js?v=2025-11-02';
 import './graph.js?v=2025-11-05';
 
@@ -107,6 +107,11 @@ function getScore(addr){ return scoreCache.get(keyFor(addr)); }
 let selTimer = null;
 function debounced(fn){ clearTimeout(selTimer); selTimer = setTimeout(fn, RXL_FLAGS.debounceMs); }
 
+/* neighbor stats cache */
+const neighborStats = new Map();              // key `${network}:${addr}` -> { n, avgDays, avgTx, inactiveRatio }
+function setNeighborStats(addr, stats){ neighborStats.set(keyFor(addr), stats); }
+function getNeighborStats(addr){ return neighborStats.get(keyFor(addr)); }
+
 /* narrative */
 let lastRenderResult = null;
 
@@ -128,10 +133,15 @@ function normalizeResult(res = {}) {
     if (!Number.isNaN(days) && days >= 0) explain.walletAgeRisk = clamp(1 - Math.min(1, days / (365 * 2)));
   }
 
-  if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
-    explain.neighborsDormant = { inactiveRatio: clamp(res.feats.local.riskyNeighborRatio || 0) };
+  // Merge client-computed neighbor stats if present
+  const ns = getNeighborStats(id);
+  if (ns) {
+    explain.neighborsDormant   = { inactiveRatio: ns.inactiveRatio, n: ns.n, avgInactiveAge: ns.avgInactiveAge ?? null };
+    if (ns.avgTx != null)  explain.neighborsAvgTxCount = { avgTx: ns.avgTx, n: ns.n };
+    if (ns.avgDays != null) explain.neighborsAvgAge     = { avgDays: ns.avgDays, n: ns.n };
   }
 
+  // Keep original fields too
   return { ...res, id, address:id, score, explain, block: blocked, blocked };
 }
 
@@ -167,7 +177,7 @@ function bindUI(){
   });
   document.getElementById('networkSelect')?.addEventListener('change', async () => {
     await post('INIT', { network:getNetwork() });
-    scoreCache.clear();
+    scoreCache.clear(); neighborStats.clear();
     scoreVisible();
   });
   document.getElementById('loadSeedBtn')?.addEventListener('click', () => {
@@ -232,11 +242,7 @@ async function focusAddress(addr, opts = {}){
   }
 
   setGraphData({ nodes:[{ id, address:id, network:getNetwork() }], links:[] });
-  if (typeof window.refreshGraphFromLive === 'function') {
-    await window.refreshGraphFromLive(id);
-  } else {
-    await refreshGraphFromLive(id); // will run because it's declared below and exported
-  }
+  await refreshGraphFromLive(id);
   window.graph?.centerOn(id, { animate:true });
   window.graph?.zoomFit();
 }
@@ -305,6 +311,38 @@ async function getNeighborsLive(centerId){
   } catch {}
   return { nodes: [], links: [] };
 }
+
+function computeNeighborStatsFor(centerId){
+  const id = normId(centerId);
+  const data = graphGetData();
+  const neighbors = (data.nodes || []).filter(n => normId(n.id) !== id);
+
+  let n = neighbors.length;
+  if (!n) { setNeighborStats(id, { n:0, inactiveRatio:0 }); return; }
+
+  let haveAge = 0, sumAge = 0;
+  let haveTx = 0, sumTx = 0;
+  let inactive = 0;
+
+  for (const nb of neighbors){
+    const s = getScore(nb.id);
+    const age = s?.feats?.ageDays;
+    const tx  = s?.explain?.txCount ?? s?.txCount;
+
+    if (typeof age === 'number') { sumAge += age; haveAge++; }
+    if (typeof tx  === 'number') { sumTx  += tx;  haveTx++; }
+
+    const isDormant = (typeof age === 'number' && age > 365) && !(tx > 0);
+    if (isDormant) inactive++;
+  }
+
+  const avgDays = haveAge ? Math.round(sumAge / haveAge) : null;
+  const avgTx   = haveTx ? (sumTx / haveTx) : null;
+  const inactiveRatio = n ? (inactive / n) : 0;
+
+  setNeighborStats(id, { n, avgDays, avgTx, inactiveRatio });
+}
+
 async function refreshGraphFromLive(centerId){
   const { nodes, links } = await getNeighborsLive(centerId);
   if (!nodes.length && !links.length) return;
@@ -321,6 +359,19 @@ async function refreshGraphFromLive(centerId){
   for (const n of nn) { if (!knownNeighbors.has(n.id)) ll.push({ a: center.id, b: n.id, weight: 1 }); }
 
   setGraphData({ nodes: finalNodes, links: ll });
+
+  // score neighbors to populate cache; then compute stats for narrative/meta
+  scoreVisible();
+  computeNeighborStatsFor(center.id);
+
+  // refresh selected panel using merged stats
+  if (selectedNodeId === center.id) {
+    const cached = getScore(center.id);
+    if (cached) {
+      const merged = normalizeResult(cached);
+      afterScore(merged);
+    }
+  }
 
   for (const n of finalNodes) { if (n.id !== center.id) window.graph?.setHalo({ id: n.id, color:'#22d37b', intensity:.5 }); }
   window.graph?.setHalo({ id: center.id, intensity:.9 });
@@ -385,8 +436,76 @@ function applyVisualCohesion(res){
   if (panel) panel.style.setProperty('--ring-color', color);
 }
 
-/* ================= Narrative stubs ================= */
-function renderNarrativePanelIfEnabled(){ /* keep or replace with your v1 renderer */ }
+/* ================= Narrative render ================= */
+function renderNarrativePanelIfEnabled(res) {
+  if (!RXL_FLAGS.enableNarrative) return;
+  const panel = document.getElementById('narrativePanel');
+  if (!panel) return;
+
+  const expl = res.explain || {};
+  const ofac = !!expl.ofacHit;
+  const ns   = expl.neighborsDormant || {};
+  const avgTx = expl.neighborsAvgTxCount?.avgTx ?? null;
+  const avgDays = expl.neighborsAvgAge?.avgDays ?? null;
+
+  // narrative line
+  const bits = [];
+  if (ofac) bits.push('direct OFAC match');
+  if (typeof res.feats?.ageDays === 'number') {
+    const k = res.explain?.walletAgeRisk ?? 0;
+    bits.push(k >= 0.6 ? `newly created (${fmtAgeDays(res.feats.ageDays)})` : `long-standing (${fmtAgeDays(res.feats.ageDays)})`);
+  }
+  if (typeof ns.inactiveRatio === 'number' && ns.inactiveRatio >= 0.6) bits.push('connected to a dormant cluster');
+  if (typeof avgTx === 'number' && avgTx >= 200) bits.push('high-volume counterparty cluster');
+
+  const txt = bits.length
+    ? 'This wallet is ' + bits.join(', ') + (ofac ? '.' : '. No direct OFAC link was found.')
+    : (ofac ? 'OFAC match detected.' : 'No direct OFAC link was found.');
+
+  const textEl = document.getElementById('rxlNarrativeText');
+  if (textEl) textEl.textContent = txt;
+
+  // badges
+  const badgesEl = document.getElementById('rxlBadges');
+  if (badgesEl) {
+    badgesEl.innerHTML = '';
+    const mk = (label, cls='') => { const s=document.createElement('span'); s.className=`badge ${cls}`; s.textContent=label; return s; };
+    badgesEl.appendChild(mk(ofac ? 'OFAC' : 'No OFAC', ofac ? 'badge-risk' : 'badge-safe'));
+    if (typeof ns.inactiveRatio === 'number' && ns.inactiveRatio >= 0.6) badgesEl.appendChild(mk('Dormant Cluster','badge-warn'));
+    if (typeof avgTx === 'number' && avgTx >= 200) badgesEl.appendChild(mk('High Counterparty Volume','badge-warn'));
+    if (expl.mixerLink) badgesEl.appendChild(mk('Mixer','badge-warn'));
+    if (expl.custodian) badgesEl.appendChild(mk('Custodian','badge-safe'));
+  }
+
+  // factors table
+  const tbody = document.querySelector('#rxlFactors tbody');
+  if (tbody) {
+    const rows = (Array.isArray(res.breakdown) && res.breakdown.length)
+      ? res.breakdown.slice(0,5).map(x => ({ label:x.label, delta:x.delta, sourceKey:'breakdown' }))
+      : [
+          { label:'Dormant neighbors', metrics: ns.inactiveRatio != null ? `inactiveRatio ${(ns.inactiveRatio*100).toFixed(1)}% (n=${ns.n||0})` : '—', delta:null, sourceKey:'neighborsDormant' },
+          { label:'Neighbors avg tx',  metrics: avgTx!=null ? `avgTx ${Math.round(avgTx)}` : '—', delta:null, sourceKey:'neighborsAvgTxCount' },
+          { label:'Neighbors avg age', metrics: avgDays!=null ? `avgDays ${Math.round(avgDays)}d` : '—', delta:null, sourceKey:'neighborsAvgAge' },
+          { label:'Wallet age',        metrics: typeof res.feats?.ageDays === 'number' ? fmtAgeDays(res.feats.ageDays) : '—', delta:null, sourceKey:'walletAgeRisk' },
+          { label:'OFAC',              metrics: ofac ? 'hit' : 'none', delta: ofac ? 40 : 0, sourceKey:'ofacHit' },
+        ];
+    tbody.innerHTML = '';
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${r.label}</td>
+        <td>${r.metrics ?? '—'}</td>
+        <td style="text-align:right;">${r.delta != null ? ('+'+r.delta) : '—'}</td>
+        <td><code>${r.sourceKey || 'derived'}</code></td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  panel.hidden = false;
+  lastRenderResult = res;
+}
+
 function hideNarrativePanel(){ const panel = document.getElementById('narrativePanel'); if (panel) panel.hidden = true; }
 
 /* ================= Exports / Diags ================= */
