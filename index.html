@@ -2,16 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>RiskXLabs — Vision</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RiskXLabs — Vision 1_5_RE</title>
+
   <link rel="icon" href="./assets/favicon.png" type="image/png"/>
+  <link rel="preload" href="./assets/css/theme.css" as="style"/>
+  <link rel="stylesheet" href="./assets/css/theme.css"/>
   <link rel="stylesheet" href="./styles.css"/>
+
+  <!-- Config first (sets window.VisionConfig.*) -->
   <script type="module" src="./config.js"></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <img class="favicon" src="./assets/favicon.png" alt="" />
+      <img class="favicon" src="./assets/favicon.png" alt=""/>
       <span class="brand-text">Risk<span class="brand-x">X</span>Labs Vision</span>
     </div>
     <nav class="nav">
@@ -25,91 +30,56 @@
   </header>
 
   <main class="layout">
+    <!-- LEFT: Graph + Controls -->
     <section class="left">
-      <!-- Graph panel -->
       <div class="panel">
         <h3 class="panel-title">Graph</h3>
 
-        <div id="graph" class="graph-canvas" aria-label="Network graph"></div>
-
-        <div class="panel-row">
-          <input id="seedInput" class="input" placeholder="Seed address (0x…)" />
-          <button id="loadSeedBtn" class="btn">Load</button>
-          <button id="clearBtn" class="btn btn-ghost">Clear</button>
+        <div id="graph" class="graph-canvas" aria-label="Network graph">
+          <!-- graph.js renders the SVG here -->
+          <div class="graph-controls">
+            <button id="navBack" class="btn" title="Back">⟵</button>
+            <button id="navForward" class="btn" title="Forward">⟶</button>
+            <button id="resetView" class="btn" title="Reset">Reset</button>
+            <button id="zoomFit" class="btn" title="Zoom Fit">Fit</button>
+          </div>
         </div>
+
+        <div class="status-line">
+          <div>
+            <input id="seedInput" class="input" placeholder="Seed address (0x…)" />
+            <button id="loadSeedBtn" class="btn">Load</button>
+            <button id="clearBtn" class="btn btn-ghost">Clear</button>
+          </div>
+          <div id="neighborStatus" class="meta">Idle</div>
+        </div>
+
+        <!-- Under-graph Control Panel -->
+        <div class="control-panel">
+          <div class="group">
+            <h4>Risk Engine</h4>
+            <label><input id="flagEngine" type="checkbox" checked/> Use Risk Engine v1_5_RE</label>
+            <label><input id="flagHeatmap" type="checkbox"/> Heatmap overlay</label>
+            <label><input id="flagSizeByValue" type="checkbox"/> Node size by value</label>
+          </div>
+          <div class="group">
+            <h4>Signals</h4>
+            <label><input id="flagCustodian" type="checkbox" checked/> Custodian tagging</label>
+            <label><input id="flagPlatform" type="checkbox" checked/> Platform flags (incl. Tokenlon)</label>
+            <label><input id="flagMixer" type="checkbox" checked/> Mixer proximity</label>
+          </div>
+        </div>
+
+        <div id="batchStatus" class="meta">Ready</div>
       </div>
-
-      <!-- Control Panel -->
-      <div class="panel">
-        <h3 class="panel-title">Controls</h3>
-
-        <div class="meta" style="margin-bottom:6px;">Toggle features and rendering behavior.</div>
-
-        <div class="panel-row" style="flex-wrap:wrap; gap:10px;">
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlNarrative" checked/>
-            <span>Narrative</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlLabels" checked/>
-            <span>Labels</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlTooltips" checked/>
-            <span>Tooltips</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlHeatmap"/>
-            <span>Heatmap (if supported)</span>
-          </label>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="panel-row" style="flex-wrap:wrap; gap:10px;">
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlFlagCustodian" checked/>
-            <span>Show Custodians</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlFlagCluster" checked/>
-            <span>Highlight High-Risk Clusters</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlFlagDormant" checked/>
-            <span>Highlight Dormant</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlFlagMixer" checked/>
-            <span>Show Mixer Proximity</span>
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="ctlFlagPlatform" checked/>
-            <span>Show Platform Entities</span>
-          </label>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="panel-row" style="gap:10px;flex-wrap:wrap;">
-          <label class="muted">Label threshold</label>
-          <input id="ctlLabelThresh" class="input" type="number" min="20" max="1000" value="150" style="width:110px;"/>
-
-          <label class="muted">Neighbor cap</label>
-          <input id="ctlNeighborCap" class="input" type="number" min="40" max="1000" value="120" style="width:110px;"/>
-
-          <button id="ctlApply" class="btn">Apply</button>
-        </div>
-      </div>
-
-      <!-- Tooltip host -->
-      <div id="rxlTooltip" style="position:fixed;display:none;background:#0c1820;border:1px solid #1a2a33;border-radius:8px;padding:8px 10px;font-size:12px;z-index:10;pointer-events:none;"></div>
     </section>
 
+    <!-- RIGHT: Details + Narrative -->
     <section class="right">
       <div class="panel">
         <h3 class="panel-title">Details</h3>
 
+        <!-- Score panel container used by ScoreMeter('#scorePanel') -->
         <div id="scorePanel" class="score-panel">
           <div class="meter">
             <svg viewBox="0 0 100 100" class="ring">
@@ -127,31 +97,32 @@
         <div id="entityMeta" class="meta"></div>
       </div>
 
-      <div id="narrativePanel" class="panel">
+      <!-- Narrative Summary -->
+      <div id="narrativePanel" class="panel narrative" hidden>
         <h3 class="panel-title">Narrative Summary</h3>
-        <div class="panel-row" style="gap:8px;align-items:center;">
-          <label class="muted">Mode</label>
-          <select id="rxlMode" class="select">
-            <option value="analyst" selected>Analyst</option>
-            <option value="consumer">Consumer</option>
-          </select>
-          <button id="rxlCopy" class="btn btn-ghost">Copy</button>
-          <button id="rxlExport" class="btn btn-ghost">Export PDF</button>
+
+        <div id="rxlBadges" class="badges"></div>
+        <div id="rxlNarrativeText" class="card"></div>
+
+        <div class="status-line">
+          <div class="meta">Mode:
+            <select id="rxlMode" class="select" style="min-width: 130px;">
+              <option value="analyst" selected>Analyst</option>
+              <option value="consumer">Consumer</option>
+            </select>
+          </div>
+          <div>
+            <button id="rxlCopy" class="btn">Copy</button>
+            <button id="rxlExport" class="btn">Export</button>
+          </div>
         </div>
-        <div id="rxlBadges" style="margin:6px 0"></div>
-        <div id="rxlNarrativeText" class="meta" style="margin:6px 0"></div>
-        <div class="divider"></div>
-        <table id="rxlFactors" style="width:100%;font-size:12px;">
-          <thead class="muted">
-            <tr><th style="text-align:left;">Factor</th><th style="text-align:left;">Metric(s)</th><th style="text-align:right;">Impact</th><th style="text-align:left;">Source</th></tr>
+
+        <table id="rxlFactors">
+          <thead>
+            <tr><th>Factor</th><th>Metrics</th><th style="text-align:right;">Δ</th><th>Source</th></tr>
           </thead>
           <tbody></tbody>
         </table>
-      </div>
-
-      <div class="panel">
-        <h3 class="panel-title">Batch Status</h3>
-        <div id="batchStatus" class="meta">Idle</div>
       </div>
     </section>
   </main>
@@ -160,6 +131,7 @@
     <span>© RiskXLabs — We Fight Fraud</span>
   </footer>
 
+  <!-- Entry (imports graph + ScoreMeter and wires the worker) -->
   <script type="module" src="./app.js"></script>
 </body>
 </html>
