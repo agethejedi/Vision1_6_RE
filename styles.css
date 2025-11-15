@@ -1,255 +1,109 @@
-:root{
-  --bg:#071016; --panel:#0c1820; --panel-2:#0f1d27; --text:#e7f7f2;
-  --muted:#8aa3a0; --primary:#00eec3; --accent:#12f0a7;
-  --danger:#ff3b3b; --warning:#ffb020; --good:#22d37b; --link:#7ee3ff;
-  --border:#1a2a33; --shadow:rgba(0,0,0,.5);
+/* =====================================================
+   RiskXLabs Vision 1_5_RE — App Layout
+   Depends on /assets/css/theme.css for variables
+   ===================================================== */
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px;
+  background: rgba(10, 14, 22, 0.9);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(8px);
 }
-*{box-sizing:border-box}
-html,body{height:100%}
-body{
-  margin:0;background:linear-gradient(180deg,#071016,#09151c 40%,#071016);
-  color:var(--text); font-family:Inter,ui-sans-serif,system-ui,Arial;
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand img { width: 22px; height: 22px; border-radius: 6px; }
+.brand .brand-text { letter-spacing: .35px; }
+.brand .brand-x { color: var(--accent); font-weight: 800; text-shadow: 0 0 10px var(--accent-glow); }
+
+.nav { display: flex; align-items: center; gap: 8px; }
+.btn, .select, .input {
+  border-radius: 10px; border: 1px solid var(--border);
+  background: var(--bg-panel); color: var(--text);
+  padding: 7px 10px; font-weight: 600;
 }
-.topbar{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:12px 16px;background:#0b141b;border-bottom:1px solid #0f1d27;
-  position:sticky;top:0;z-index:5;
-}
-.brand{display:flex;align-items:center;gap:10px}
-.favicon{width:24px;height:24px;border-radius:6px;filter:drop-shadow(0 0 6px #0ef)}
-.brand-text{letter-spacing:.4px}
-.brand-x{color:#0ef;font-weight:800;text-shadow:0 0 8px #0ef}
+.btn:hover { border-color: var(--accent-soft); box-shadow: 0 0 8px rgba(0,230,255,.25); }
+.btn-ghost { background: transparent; }
 
-.nav{display:flex;align-items:center;gap:10px}
-.btn{
-  background:var(--panel-2);border:1px solid var(--border);color:var(--text);
-  padding:8px 12px;border-radius:10px;cursor:pointer;box-shadow:0 4px 14px var(--shadow);
-}
-.btn:hover{border-color:#20414f}
-.btn-ghost{background:transparent}
-.select,.input{
-  background:#0d1a22;border:1px solid var(--border);color:var(--text);
-  padding:8px 10px;border-radius:10px;min-width:160px;
-}
-.layout{display:grid;grid-template-columns:1fr 360px;gap:16px;padding:16px;max-width:1600px;margin:0 auto}
-.left,.right{display:grid;gap:16px}
-.panel{
-  background:var(--panel);border:1px solid var(--border);border-radius:14px;
-  padding:14px;box-shadow:0 8px 24px var(--shadow)
-}
-.panel-title{margin:0 0 10px;font-weight:700}
-.panel-row{display:flex;gap:8px;margin-top:10px}
-.meta{color:var(--muted);font-size:12px;line-height:1.5}
-.foot{padding:14px;color:var(--muted);text-align:center;border-top:1px solid #0f1d27;margin-top:10px}
-
-/* === GRAPH CANVAS (SVG) ================================================== */
-
-.graph-canvas, #graph{
-  position:relative;
-  width:100%;
-  height:520px;                 /* adjust to fit your card */
-  border-radius:12px;
-  background:#08131a;
-  border:1px solid #0f1d27;
-  overflow:hidden;
-}
-
-/* SVG groups created by graph.js */
-.vision-graph .edge { stroke: rgba(255,255,255,0.08); stroke-width: 1; }
-.vision-graph .node-outer { fill:#0f172a; stroke:rgba(255,255,255,0.18); stroke-width:2; }
-.vision-graph .node-inner { fill: rgba(94,234,212,1); }
-.vision-graph .nodes g { cursor:pointer; }
-
-/* SVG-friendly halos: animate the OUTER circle stroke as a pulse */
-.vision-graph g.halo .node-outer {
-  stroke: rgba(34, 211, 178, 0.45);
-  animation: haloPulse 2s ease-out infinite;
-}
-.vision-graph g.halo.halo-red .node-outer {
-  stroke: rgba(239, 68, 68, 0.60);
-  animation: haloPulseRed 2s ease-out infinite;
-}
-
-@keyframes haloPulse {
-  0%   { stroke-width:14; opacity:.45 }
-  70%  { stroke-width:2;  opacity:0 }
-  100% { stroke-width:2;  opacity:0 }
-}
-@keyframes haloPulseRed {
-  0%   { stroke-width:16; opacity:.55 }
-  70%  { stroke-width:2;  opacity:0 }
-  100% { stroke-width:2;  opacity:0 }
-}
-
-/* Optional score bands if you tint nodes */
-.band-high     { outline: 2px solid rgba(239, 68, 68, 0.35); }
-.band-elevated { outline: 2px solid rgba(245, 158, 11, 0.35); }
-.band-moderate { outline: 2px solid rgba(16, 185, 129, 0.25); }
-
-/* === SCORE METER ========================================================= */
-
-.score-panel { position:relative; }
-.score-panel .meter { position:relative; width:140px; height:140px; margin:8px 0; }
-.score-panel .ring  { position:absolute; inset:0; transform: rotate(-90deg); }
-.score-panel .track { stroke: rgba(255,255,255,0.07); }
-.score-panel .arc   { stroke: var(--ring-color, #10b981); }
-.score-panel .label { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
-.score-panel .score-text { font-size:28px; font-weight:700; }
-.score-panel .score-sub  { opacity:.7; font-size:12px; }
-.score-panel .reasons    { margin-top:8px; font-size:12px; color:var(--muted); }
-.score-panel .reasons .reason { margin:2px 0; }
-
-.score-meter { --ring-color:#10b981; }
-.score-meter.blocked { --ring-color:#ef4444; } /* red */
-
-/* Back-compat for any div-ring variant */
-.score-meter .ring-div { box-shadow: 0 0 0 3px var(--ring-color) inset; }
-
-/* === SAFE SEND BADGE & RISK FACTORS ==================================== */
-
-/* SafeSend badge */
-.badge{
-  display:inline-block;
-  padding:4px 8px;
-  border-radius:9999px;
-  font-size:11px;
-  line-height:1;
-  background:rgba(16,185,129,.14);
-  color:#a7f3d0;
-  border:1px solid rgba(16,185,129,.28);
-  margin-bottom:8px;
-}
-.score-meter.blocked .badge{
-  background:rgba(239,68,68,.12);
-  color:#fecaca;
-  border-color:rgba(239,68,68,.28);
-}
-
-/* Reasons list */
-.reasons{ margin-top:8px; }
-.reason{
-  display:flex; justify-content:space-between; align-items:center;
-  padding:4px 0; font-size:12px; color:var(--muted);
-  border-top:1px dashed rgba(255,255,255,0.05);
-}
-.reason:first-child{ border-top:0; }
-.reason .val{ color:#cfeee8; font-variant-numeric:tabular-nums; }
-.muted{ opacity:.7; }
-
-/* === DETAILS / SCORE CARD POLISH ======================================= */
-
-.score-card{
-  background: rgba(0,0,0,0.12);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 12px;
+/* Main layout: graph left, details right */
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  gap: 14px;
   padding: 12px;
+  height: calc(100vh - 56px);
+  box-sizing: border-box;
+}
+.left, .right { display: grid; gap: 12px; min-height: 0; }
+.panel { min-height: 0; }
+
+.panel-title {
+  margin: 0 0 8px; font-weight: 700; color: var(--accent-soft);
+  text-shadow: 0 0 6px var(--accent-glow);
 }
 
-.score-header{
-  display:flex; align-items:center; justify-content:space-between;
-  margin-bottom: 8px;
-}
-.score-header .title{ font-weight:700; }
-
-.badge{
-  display:inline-block; padding:4px 8px; border-radius:9999px;
-  font-size:11px; line-height:1;
-  background: rgba(16,185,129,.14);
-  color:#a7f3d0; border:1px solid rgba(16,185,129,.28);
-}
-.score-meter.blocked .badge{
-  background: rgba(239,68,68,.12);
-  color:#fecaca; border-color: rgba(239,68,68,.28);
+/* Graph canvas */
+.graph-canvas {
+  position: relative; height: 560px;
+  border: 1px solid var(--border); border-radius: 14px;
+  background: radial-gradient(80% 80% at 50% 50%, #10151f, #070a10);
+  overflow: hidden;
 }
 
-/* Meter & ring */
-.score-card .meter{ position:relative; width:180px; height:180px; margin:6px auto; }
-.score-card .ring{ position:absolute; inset:0; transform: rotate(-90deg); }
-.score-card .track{ stroke: rgba(255,255,255,0.08); }
-.score-card .arc{   stroke: var(--ring-color, #10b981); }
-
-/* Segmented tick marks around ring */
-.ring .ticks line.tick{
-  stroke: rgba(255,255,255,0.08);
-  stroke-width: 1;
+/* Graph controls in top-right of the canvas */
+.graph-controls {
+  position: absolute; top: 8px; right: 8px; z-index: 5;
+  display: flex; gap: 6px;
+}
+.graph-controls .btn {
+  padding: 4px 8px; font-size: 12px;
+  background: rgba(0, 230, 255, 0.08);
+  color: var(--accent-soft);
+}
+.graph-controls .btn:hover {
+  background: var(--accent-soft); color: #000;
 }
 
-/* Label & subtitle */
-.score-card .label{
-  position:absolute; inset:0; display:flex; flex-direction:column;
-  align-items:center; justify-content:center;
+/* Under-graph control panel */
+.control-panel {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  margin-top: 10px;
 }
-.score-card .score-text{ font-size:32px; font-weight:800; letter-spacing:0.5px; }
-.score-card .score-sub{ font-size:12px; color: var(--muted); }
+.control-panel .group { border: 1px dashed var(--border); border-radius: 10px; padding: 8px; }
+.control-panel .group h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+.control-panel label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 
-/* Divider line */
-.divider{
-  margin: 10px 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,.12), transparent);
-}
+/* Score / Details card */
+.score-panel .reasons { margin-top: 10px; }
+.meta { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
-/* Reasons list */
-.reasons{ font-size:12px; }
-.reason{
-  display:flex; justify-content:space-between; align-items:center;
-  padding:6px 4px; color:var(--muted);
-  border-top: 1px dashed rgba(255,255,255,0.06);
+/* Narrative panel */
+#narrativePanel[hidden] { display: none !important; }
+.narrative {
+  display: grid; gap: 8px; font-size: 13px;
 }
-.reason:first-child{ border-top:none; }
-.reason .val{ color:#cfeee8; font-variant-numeric: tabular-nums; }
-.muted{ opacity:.75; }
-/* === NARRATIVE PANEL (Vision) =========================================== */
+.narrative .badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.narrative table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+}
+.narrative th, .narrative td {
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.narrative th { background: rgba(0,0,0,.2); text-align: left; color: var(--muted); }
+.narrative tr:last-child td { border-bottom: 0; }
 
-#narrativePanel .panel-title { margin-bottom: 6px; }
-#narrativePanel .meta { margin-top: 6px; }
+/* Batch/neighbor status */
+.status-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.spinner {
+  width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent-soft);
+  border-radius: 50%; animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
-/* Badge row container */
-.badge-row{
-  display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 4px;
-}
-
-/* Badge variants (reuse your .badge base) */
-.badge-risk{
-  background: rgba(255,59,59,.12);
-  color:#fecaca;
-  border:1px solid rgba(255,59,59,.28);
-}
-.badge-warn{
-  background: rgba(255,176,32,.10);
-  color:#ffe3b0;
-  border:1px solid rgba(255,176,32,.28);
-}
-.badge-safe{
-  background: rgba(16,185,129,.14);
-  color:#a7f3d0;
-  border:1px solid rgba(16,185,129,.28);
-}
-
-/* Table for factors */
-.table-wrap{ overflow:auto; border-top:1px solid var(--border); margin-top:6px; }
-.table{
-  width:100%; border-collapse:collapse; font-size:12px;
-}
-.table th, .table td{
-  padding:8px 10px; border-bottom:1px solid var(--border);
-}
-.table thead th{
-  color:var(--muted); font-weight:700; text-align:left;
-}
-.table td code{
-  background:rgba(255,255,255,.04);
-  border:1px solid rgba(255,255,255,.06);
-  padding:2px 6px; border-radius:6px; font-size:11px;
-}
-
-/* Buttons & select in the panel align nicely on small widths */
-#narrativePanel .panel-row .btn,
-#narrativePanel .panel-row .select{
-  height:34px;
-}
-
-/* Optional subtle hover for rows */
-.table tbody tr:hover{
-  background:rgba(255,255,255,.03);
+/* Footer */
+.foot {
+  padding: 10px; color: var(--muted); text-align: center;
+  border-top: 1px solid var(--border);
 }
