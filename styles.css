@@ -194,3 +194,9 @@
   60%  { stroke-width: 2;  opacity: 0.0; }
   100% { stroke-width: 2;  opacity: 0.0; }
 }
+.graph-canvas text {
+  fill: #cdd6f4 !important;      /* brighter cyan-gray */
+  font-size: 13px !important;
+  font-weight: 500;
+  text-shadow: 0 0 3px #000;
+}
