@@ -156,3 +156,41 @@
   font-size: 12px;
   opacity: 0.75;
 }
+/* === Focused node pulse + hexagon ==================================== */
+
+/* Base node look stays circular for non-focused nodes */
+.vision-graph g.node .node-outer {
+  stroke-width: 2;
+  transition: stroke 0.25s ease, fill 0.25s ease, opacity 0.25s ease;
+}
+
+/* Focused node: pulse the outer circle only for the node in focus */
+.vision-graph g.node.focused .node-outer {
+  stroke: rgba(250, 204, 21, 0.85); /* amber-ish highlight */
+  animation: focusPulse 2.1s ease-out infinite;
+}
+
+/* Hexagon overlay for the focused node */
+.vision-graph g.node .node-hex {
+  fill: none;
+  stroke: rgba(250, 204, 21, 0.95);
+  stroke-width: 2;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+/* Only the focused node shows the hexagon and mutes its inner circle */
+.vision-graph g.node.focused .node-hex {
+  opacity: 1;
+}
+.vision-graph g.node.focused .node-inner {
+  opacity: 0.0;
+}
+
+/* Pulse animation similar to Vision 1_4 but scoped to focused node */
+@keyframes focusPulse {
+  0%   { stroke-width: 14; opacity: 0.6; }
+  60%  { stroke-width: 2;  opacity: 0.0; }
+  100% { stroke-width: 2;  opacity: 0.0; }
+}
