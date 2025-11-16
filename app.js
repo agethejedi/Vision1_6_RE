@@ -3,6 +3,7 @@
 
 import './ui/ScoreMeter.js?v=2025-11-15';     // window.ScoreMeter(...)
 import './graph.js?v=2025-11-15';             // window.graph (on/setData/getData/setHalo)
+import { colorForScore, bandForScore } from './lib/risk-colors.js';
 import { applyFeatureTogglesFromUI } from './config.js';
 
 /* ================= Feature Flags & Graph Config ==================== */
@@ -369,16 +370,7 @@ function isBlockedVisual(res){
   return !!(res.block || res.blocked || res.risk_score === 100 ||
             res.sanctionHits || res.explain?.ofacHit || res.ofac === true);
 }
-// High > 65 (red), Medium 35–65 (yellow), Low < 35 (green)
-function colorForScore(score, blocked) {
-  const s = Number(score || 0);
 
-  if (blocked) return '#ef4444';        // blocked / OFAC hard red
-
-  if (s > 65)  return '#ef4444';        // high risk — red
-  if (s >= 35) return '#eab308';        // medium risk — yellow
-  return '#22c55e';                     // low risk — green
-}
 
 function applyVisualCohesion(res){
   lastRenderResult = res;
