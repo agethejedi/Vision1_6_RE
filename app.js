@@ -38,11 +38,15 @@ worker.onmessage = (e) => {
   if (type === 'RESULT_STREAM') {
     const r = normalizeResult(data);
     drawHalo(r);
-    if (r.id === selectedNodeId) {
+
+    // NEW: be tolerant on id match and allow first result to “claim” the panel
+    const same = String(r.id || '').toLowerCase() === String(selectedNodeId || '').toLowerCase();
+    if (same || !selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
     }
+
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
     return;
   }
@@ -50,11 +54,15 @@ worker.onmessage = (e) => {
   if (type === 'RESULT') {
     const r = normalizeResult(data);
     drawHalo(r);
-    if (r.id === selectedNodeId) {
+
+    // NEW: same compare logic as above
+    const same = String(r.id || '').toLowerCase() === String(selectedNodeId || '').toLowerCase();
+    if (same || !selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
     }
+
     if (req) { req.resolve(r); pending.delete(id); }
     return;
   }
@@ -371,6 +379,7 @@ function isBlockedVisual(res){
             res.sanctionHits || res.explain?.ofacHit || res.ofac === true);
 }
 
+let lastRenderResult = null;
 
 function applyVisualCohesion(res){
   lastRenderResult = res;
