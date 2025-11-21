@@ -522,7 +522,7 @@ async function refreshGraphFromLive(centerId){
 
 /* ================= Narrative Engine v1 =========================== */
 
-let lastRenderResult = null;
+
 
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
