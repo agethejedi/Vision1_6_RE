@@ -1,4 +1,4 @@
-// app.js — Vision 1_5_RE
+// app.js — Vision 1_5_RE / 1_6 shell
 // Front-end controller: graph + worker + narrative + controls
 
 import './ui/ScoreMeter.js?v=2025-11-15';     // window.ScoreMeter(...)
@@ -38,15 +38,11 @@ worker.onmessage = (e) => {
   if (type === 'RESULT_STREAM') {
     const r = normalizeResult(data);
     drawHalo(r);
-
-    // NEW: be tolerant on id match and allow first result to “claim” the panel
-    const same = String(r.id || '').toLowerCase() === String(selectedNodeId || '').toLowerCase();
-    if (same || !selectedNodeId) {
+    if (r.id === selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
     }
-
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
     return;
   }
@@ -54,15 +50,11 @@ worker.onmessage = (e) => {
   if (type === 'RESULT') {
     const r = normalizeResult(data);
     drawHalo(r);
-
-    // NEW: same compare logic as above
-    const same = String(r.id || '').toLowerCase() === String(selectedNodeId || '').toLowerCase();
-    if (same || !selectedNodeId) {
+    if (r.id === selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
     }
-
     if (req) { req.resolve(r); pending.delete(id); }
     return;
   }
@@ -86,10 +78,14 @@ worker.onmessage = (e) => {
 
 function normalizeResult(res = {}) {
   const id = normId(res.id || res.address);
-  const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
-  const score = (serverScore != null)
-    ? serverScore
-    : (typeof res.score === 'number' ? res.score : 0);
+
+  // Prefer risk_score from backend; fall back to top-level score.
+  const serverScore =
+    typeof res.risk_score === 'number'
+      ? res.risk_score
+      : (typeof res.score === 'number' ? res.score : null);
+
+  const score = serverScore != null ? serverScore : 0;
 
   const blocked = !!(
     res.block ||
@@ -98,41 +94,54 @@ function normalizeResult(res = {}) {
     res.ofac === true
   );
 
-  const explain = (res.explain && typeof res.explain === 'object')
+  let explain = (res.explain && typeof res.explain === 'object')
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
+  // Ensure OFAC flag is set on explain
   coerceOfacFlag(explain, res);
+
+  // Force explain.score to match the final server score so the meter & narrative agree
+  if (serverScore != null) {
+    explain.score = serverScore;
+  }
+
+  const feats = res.feats || {};
 
   // Wallet-age → normalized risk (younger = higher)
   if (typeof explain.walletAgeRisk !== 'number') {
-    const days = Number(res.feats?.ageDays ?? NaN);
+    const days = Number(feats.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
       explain.walletAgeRisk = clamp(1 - Math.min(1, days / (365 * 2)));
     }
   }
 
   // Neighbor proxies
-  if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
-    const r = Number(res.feats.local.riskyNeighborRatio) || 0;
+  const neighborCount =
+    feats.local?.neighborCount ??
+    feats.neighborCount ??
+    null;
+
+  if (!explain.neighborsDormant && feats.local?.riskyNeighborRatio != null) {
+    const r = Number(feats.local.riskyNeighborRatio) || 0;
     explain.neighborsDormant = {
       inactiveRatio: clamp(r),
-      avgInactiveAge: res.feats.local.neighborAvgAgeDays ?? null,
+      avgInactiveAge: feats.local.neighborAvgAgeDays ?? null,
       resurrected: 0,
       whitelistPct: 0,
-      n: res.feats.local.neighborCount ?? null
+      n: neighborCount
     };
   }
-  if (!explain.neighborsAvgTxCount && res.feats?.local?.neighborAvgTx != null) {
+  if (!explain.neighborsAvgTxCount && feats.local?.neighborAvgTx != null) {
     explain.neighborsAvgTxCount = {
-      avgTx: Number(res.feats.local.neighborAvgTx) || 0,
-      n: res.feats.local.neighborCount ?? null
+      avgTx: Number(feats.local.neighborAvgTx) || 0,
+      n: neighborCount
     };
   }
-  if (!explain.neighborsAvgAge && res.feats?.local?.neighborAvgAgeDays != null) {
+  if (!explain.neighborsAvgAge && feats.local?.neighborAvgAgeDays != null) {
     explain.neighborsAvgAge = {
-      avgDays: Number(res.feats.local.neighborAvgAgeDays) || 0,
-      n: res.feats.local.neighborCount ?? null
+      avgDays: Number(feats.local.neighborAvgAgeDays) || 0,
+      n: neighborCount
     };
   }
 
@@ -249,10 +258,7 @@ function bindUI() {
   const modeSel = document.getElementById('rxlMode');
   if (modeSel) modeSel.addEventListener('change', () => lastRenderResult && renderNarrativePanelIfEnabled(lastRenderResult));
   const copyBtn = document.getElementById('rxlCopy');
-  if (copyBtn) copyBtn.addEventListener('click', async () => {
-    const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
-    try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
-  });
+  if (copyBtn) addCopyHandler(copyBtn);
   const exportBtn = document.getElementById('rxlExport');
   if (exportBtn) exportBtn.addEventListener('click', () => { flash(exportBtn, 'Queued'); });
 
@@ -263,6 +269,13 @@ function bindUI() {
       applyVisualCohesion(lastRenderResult);
       renderNarrativePanelIfEnabled(lastRenderResult);
     }
+  });
+}
+
+function addCopyHandler(btn){
+  btn.addEventListener('click', async () => {
+    const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
+    try { await navigator.clipboard.writeText(txt); flash(btn, 'Copied!'); } catch {}
   });
 }
 
@@ -357,8 +370,9 @@ function updateScorePanel(res) {
   scorePanel.setSummary(res);
 
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
-  const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
-  const neighCount = feats.local?.neighborCount ?? null;
+  const neighRatio = feats.local?.riskyNeighborRatio ?? 0;
+  const neighPct = Math.round(neighRatio * 100) + '%';
+  const neighCount = feats.local?.neighborCount ?? feats.neighborCount ?? null;
 
   const neighborLine = `Neighbors flagged: <b>${neighPct}</b>` +
     (typeof neighCount === 'number' ? ` (${neighCount} neighbors)` : '');
@@ -378,8 +392,6 @@ function isBlockedVisual(res){
   return !!(res.block || res.blocked || res.risk_score === 100 ||
             res.sanctionHits || res.explain?.ofacHit || res.ofac === true);
 }
-
-let lastRenderResult = null;
 
 function applyVisualCohesion(res){
   lastRenderResult = res;
@@ -401,7 +413,8 @@ function applyVisualCohesion(res){
   if (F.heatmap && typeof window.graph?.setHeatmap === 'function') {
     window.graph.setHeatmap(res.id, res.score || 0);
   }
-  if (F.nodeSizeByValue && typeof feats.balanceUsd === 'number' &&
+  if (F.nodeSizeByValue &&
+      typeof feats.balanceUsd === 'number' &&
       typeof window.graph?.setNodeSize === 'function') {
     window.graph.setNodeSize(res.id, Math.log10(feats.balanceUsd + 10));
   }
@@ -522,7 +535,7 @@ async function refreshGraphFromLive(centerId){
 
 /* ================= Narrative Engine v1 =========================== */
 
-
+let lastRenderResult = null;
 
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
