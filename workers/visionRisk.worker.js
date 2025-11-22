@@ -1,419 +1,238 @@
-// server.worker.js — RiskXLabs Vision API v1.6.0
-// Endpoints:
-//   GET /                      -> health
-//   GET /score?address&network -> risk score (core engine)
-//   GET /check?address&network -> alias for /score
-//   GET /txs?address&network   -> stub tx list (for ageDays)
-//   GET /neighbors?address&network -> stub neighbor graph
-//
-// NOTE: This is a self-contained stubbed engine suitable for dev.
-//       Real data adapters can be wired into the riskModel later.
+// workers/visionRisk.worker.js
+// Vision 1.6 — front-end worker
+// Proxies scoring & neighbors to the Cloudflare risk engine.
 
-const VERSION = "RXL-V1.6.0";
+let CFG = {
+  apiBase: "",
+  network: "eth",
+  concurrency: 8,
+  flags: {
+    graphSignals: true,
+    streamBatch: true,
+    neighborStats: true,
+    cacheNeighborsTTL: 600000 // 10 min
+  },
+};
 
-/* ====================== CORS HELPERS ====================== */
+self.onmessage = async (e) => {
+  const { id, type, payload } = e.data || {};
+  try {
+    if (type === "INIT") {
+      if (payload?.apiBase) CFG.apiBase = String(payload.apiBase).replace(/\/$/, "");
+      if (payload?.network) CFG.network = payload.network;
+      if (payload?.concurrency) CFG.concurrency = payload.concurrency;
+      if (payload?.flags) CFG.flags = { ...CFG.flags, ...payload.flags };
 
-function corsHeaders(extra = {}) {
-  return {
-    "Access-Control-Allow-Origin": "*",         // or lock down to your origin
-    "Access-Control-Allow-Methods": "GET,OPTIONS",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Max-Age": "86400",
-    ...extra,
-  };
+      post({ id, type: "INIT_OK" });
+      return;
+    }
+
+    if (type === "SCORE_ONE") {
+      const item = payload?.item;
+      const res = await scoreOne(item);
+      post({ id, type: "RESULT", data: res });
+      return;
+    }
+
+    if (type === "SCORE_BATCH") {
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      for (const it of items) {
+        const r = await scoreOne(it);
+        post({ type: "RESULT_STREAM", data: r });
+      }
+      post({ id, type: "DONE" });
+      return;
+    }
+
+    if (type === "NEIGHBORS") {
+      const addr = (payload?.id || payload?.address || "").toLowerCase();
+      const network = payload?.network || CFG.network || "eth";
+      const hop = Number(payload?.hop ?? 1) || 1;
+      const limit = Number(payload?.limit ?? 250) || 250;
+
+      const data = await fetchNeighbors(addr, network, { hop, limit }).catch(() =>
+        stubNeighbors(addr)
+      );
+      post({ id, type: "RESULT", data });
+      return;
+    }
+
+    throw new Error(`unknown type: ${type}`);
+  } catch (err) {
+    post({ id, type: "ERROR", error: String(err?.message || err) });
+  }
+};
+
+function post(msg) {
+  self.postMessage(msg);
 }
 
-function jsonResponse(obj, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: corsHeaders({
-      "content-type": "application/json; charset=utf-8",
-      ...extraHeaders,
-    }),
+/* ====================== SCORE CORE ======================= */
+
+async function scoreOne(item) {
+  const idRaw = item?.id || item?.address || "";
+  const id = String(idRaw).toLowerCase();
+  const network = item?.network || CFG.network || "eth";
+  if (!id) throw new Error("scoreOne: missing id");
+  if (!CFG.apiBase) throw new Error("scoreOne: apiBase not configured");
+
+  const url = `${CFG.apiBase}/score?address=${encodeURIComponent(
+    id
+  )}&network=${encodeURIComponent(network)}`;
+
+  const r = await fetch(url, {
+    headers: { accept: "application/json" },
+    cf: { cacheTtl: 0 },
   });
-}
 
-function textResponse(text, status = 200, extraHeaders = {}) {
-  return new Response(text, {
-    status,
-    headers: corsHeaders({
-      "content-type": "text/plain; charset=utf-8",
-      ...extraHeaders,
-    }),
-  });
-}
-
-function handleOptions() {
-  // CORS preflight
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders(),
-  });
-}
-
-/* ====================== RISK MODEL (stub) ====================== */
-
-// Simple clamp utility
-const clamp = (x, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, x));
-
-function makeStubFeats(address, network) {
-  // Deterministic-feeling stub: fixed profile for now
-  // You can later swap this out for real feature fetchers.
-  const ageDays = 1309; // ~3.6 years
-  const txCount = 809;
-  const activeDays = 30;
-  const txPerDay = txCount / activeDays; // ~26.97
-  const burstScore = 0.51;
-
-  const uniqueCounterparties = 10;
-  const topCounterpartyShare = 0.02;
-
-  const neighborCount = 9;
-  const sanctionedNeighborRatio = 0.28;
-  const highRiskNeighborRatio = 0.32;
-  const dormantNeighborRatio = 0.0;
-
-  const mixerProximity = 0.42;
-  const custodianExposure = 0.38;
-  const scamPlatformExposure = 0.49;
-
-  return {
-    ageDays,
-    firstSeenMs: null,
-    txCount,
-    activeDays,
-    txPerDay,
-    burstScore,
-    uniqueCounterparties,
-    topCounterpartyShare,
-    isDormant: false,
-    dormantDays: 0,
-    resurrectedRecently: false,
-    neighborCount,
-    sanctionedNeighborRatio,
-    highRiskNeighborRatio,
-    dormantNeighborRatio,
-    mixerProximity,
-    custodianExposure,
-    scamPlatformExposure,
-    local: {
-      riskyNeighborRatio: highRiskNeighborRatio,
-      neighborAvgTx: txPerDay,
-      neighborAvgAgeDays: ageDays,
-    },
-  };
-}
-
-// Age factor
-function agePart(feats) {
-  const ageDays = feats.ageDays ?? 0;
-  let impact = 0;
-  let bucket = "unknown";
-
-  if (ageDays <= 0) {
-    impact = 0;
-    bucket = "unknown";
-  } else if (ageDays < 90) {
-    impact = 10;
-    bucket = "< 3 months";
-  } else if (ageDays < 365 * 2) {
-    impact = 0;
-    bucket = "3–24 months";
-  } else {
-    impact = -10;
-    bucket = "> 2 years";
+  if (!r.ok) {
+    throw new Error(`score fetch failed: ${r.status}`);
   }
 
-  return {
-    id: "age",
-    label: "Wallet age",
-    impact,
-    details: { ageDays, bucket },
-  };
+  const body = await r.json().catch(() => ({}));
+
+  // body is already the risk-engine response (risk_score, reasons, feats, explain, etc.)
+  const merged = normalizeFromEngine(body, id, network);
+
+  return merged;
 }
 
-// Velocity factor
-function velocityPart(feats) {
-  const txPerDay = feats.txPerDay ?? 0;
-  const burstScore = feats.burstScore ?? 0;
-  let impact = 0;
-  let bucket = "low";
+function normalizeFromEngine(engineRes, id, network) {
+  const base = engineRes || {};
 
-  if (txPerDay > 20 || burstScore > 0.5) {
-    impact = 20;
-    bucket = "extreme";
-  } else if (txPerDay > 5) {
-    impact = 10;
-    bucket = "elevated";
-  } else if (txPerDay > 1) {
-    impact = 5;
-    bucket = "moderate";
+  // Ensure id / address / network are present and normalized
+  const addr = (base.address || id || "").toLowerCase();
+  const net = base.network || network || "eth";
+
+  const risk_score =
+    typeof base.risk_score === "number" ? base.risk_score : base.score || 0;
+
+  // Feats: add local neighbor stats if the engine exposes them flat
+  const feats = { ...(base.feats || {}) };
+
+  if (!feats.local) {
+    feats.local = {};
   }
 
-  return {
-    id: "velocity",
-    label: "Transaction velocity & bursts",
-    impact,
-    details: { txPerDay, burstScore, bucket },
-  };
-}
-
-// Counterparty mix
-function mixPart(feats) {
-  const uniqueCounterparties = feats.uniqueCounterparties ?? 0;
-  const topShare = feats.topCounterpartyShare ?? 0;
-  let impact = 0;
-  let bucket = "unknown";
-
-  if (uniqueCounterparties === 0) {
-    impact = 0;
-    bucket = "unknown";
-  } else if (uniqueCounterparties >= 20 && topShare < 0.2) {
-    impact = -5;
-    bucket = "highly diversified";
-  } else if (uniqueCounterparties >= 8 && topShare < 0.4) {
-    impact = -2;
-    bucket = "diversified";
-  } else if (topShare > 0.7) {
-    impact = 10;
-    bucket = "highly concentrated";
-  } else {
-    impact = 0;
-    bucket = "mixed";
+  // Map high-level neighbor features into feats.local.* expected by app.js
+  if (typeof feats.highRiskNeighborRatio === "number") {
+    feats.local.riskyNeighborRatio = feats.highRiskNeighborRatio;
+  } else if (typeof feats.sanctionedNeighborRatio === "number") {
+    feats.local.riskyNeighborRatio = feats.sanctionedNeighborRatio;
   }
 
-  return {
-    id: "mix",
-    label: "Counterparty mix & concentration",
-    impact,
-    details: { uniqueCounterparties, topCounterpartyShare: topShare, bucket },
-  };
-}
+  if (typeof feats.neighborAvgAgeDays === "number") {
+    feats.local.neighborAvgAgeDays = feats.neighborAvgAgeDays;
+  }
+  if (typeof feats.neighborAvgTx === "number") {
+    feats.local.neighborAvgTx = feats.neighborAvgTx;
+  }
+  if (typeof feats.neighborCount === "number") {
+    feats.local.neighborCount = feats.neighborCount;
+  }
 
-// Flow concentration (fan-in/out) — stubbed neutral for now
-function concentrationPart(/* feats */) {
-  return {
-    id: "concentration",
-    label: "Flow concentration (fan-in/out)",
-    impact: 0,
-    details: {},
-  };
-}
+  const explain = base.explain && typeof base.explain === "object"
+    ? { ...base.explain }
+    : { reasons: base.reasons || base.risk_factors || [] };
 
-// Dormant / resurrection — stubbed neutral
-function dormantPart(feats) {
-  return {
-    id: "dormant",
-    label: "Dormancy & resurrection patterns",
-    impact: 0,
-    details: {
-      isDormant: !!feats.isDormant,
-      dormantDays: feats.dormantDays ?? 0,
-      resurrectedRecently: !!feats.resurrectedRecently,
-    },
-  };
-}
-
-// Neighbor & cluster risk
-function neighborPart(feats) {
-  const sancRatio = feats.sanctionedNeighborRatio ?? 0;
-  const highRiskRatio = feats.highRiskNeighborRatio ?? 0;
-  const mixedCluster =
-    highRiskRatio > 0.25 || sancRatio > 0.1 || feats.neighborCount > 0;
-
-  let impact = 0;
-  if (mixedCluster) impact = 5;
+  const blocked = !!(
+    base.block ||
+    risk_score === 100 ||
+    base.sanctionHits ||
+    explain?.signals?.ofacHit
+  );
 
   return {
-    id: "neighbor",
-    label: "Neighbor & cluster risk",
-    impact,
-    details: {
-      neighborCount: feats.neighborCount ?? 0,
-      sanctionedNeighborRatio: sancRatio,
-      highRiskNeighborRatio: highRiskRatio,
-      mixedCluster,
-    },
-  };
-}
-
-// Lists / external signals — currently stubbed
-function listsPart(/* feats, signals */) {
-  return {
-    id: "lists",
-    label: "External fraud & platform signals",
-    impact: 0,
-    details: {},
-  };
-}
-
-// Governance / override — stubbed
-function governancePart(/* feats, signals */) {
-  return {
-    id: "governance",
-    label: "Governance / override",
-    impact: 0,
-    details: {},
-  };
-}
-
-// Main risk model
-function scoreAddress(address, network) {
-  const addr = (address || "").toLowerCase();
-  const net = (network || "eth").toLowerCase();
-
-  const feats = makeStubFeats(addr, net);
-
-  // Build parts
-  const parts = {
-    age: agePart(feats),
-    velocity: velocityPart(feats),
-    mix: mixPart(feats),
-    concentration: concentrationPart(feats),
-    dormant: dormantPart(feats),
-    neighbor: neighborPart(feats),
-    lists: listsPart(feats),
-    governance: governancePart(feats),
-  };
-
-  const partList = Object.values(parts);
-
-  const baseScore = 15;
-  const rawContribution = partList.reduce((sum, p) => sum + (p.impact || 0), 0);
-  const score = clamp(baseScore + rawContribution, 0, 100);
-
-  // Build reasons: nonzero impacts, sorted by absolute impact desc
-  const reasons = partList
-    .filter((p) => (p.impact || 0) !== 0)
-    .sort((a, b) => Math.abs(b.impact || 0) - Math.abs(a.impact || 0))
-    .map((p) => p.label);
-
-  const explain = {
-    version: VERSION,
+    type: "address",
+    id: addr,
     address: addr,
     network: net,
-    baseScore,
-    rawContribution,
-    score,
-    confidence: 1,
-    parts,
-    feats,
-    signals: {
-      ofacHit: false,
-      chainabuse: false,
-      caFraud: false,
-      scamPlatform: false,
-      mixer: false,
-      custodian: false,
-      unifiedSanctions: null,
-      chainalysis: null,
-      scorechain: null,
-    },
-    notes: [],
-  };
-
-  const payload = {
-    address: addr,
-    network: net,
-    risk_score: score,
-    reasons,
-    risk_factors: reasons,
-    block: false,
-    sanctionHits: null,
+    risk_score,
+    score: risk_score,
+    reasons: base.reasons || base.risk_factors || [],
+    risk_factors: base.risk_factors || base.reasons || [],
+    block: blocked,
+    sanctionHits: base.sanctionHits || null,
     feats,
     explain,
-  };
-
-  return payload;
-}
-
-/* ====================== STUB DATA ENDPOINTS ====================== */
-
-function stubTxs(address, network) {
-  // Very small stub: earliest tx at ~ageDays ago
-  const feats = makeStubFeats(address, network);
-  const now = Date.now();
-  const msAgo = (feats.ageDays ?? 0) * 86400000;
-  const tsMs = now - msAgo;
-
-  return {
-    result: [
-      {
-        hash: "0xstubtx" + address.slice(2, 10),
-        raw: {
-          metadata: {
-            blockTimestamp: new Date(tsMs).toISOString(),
-          },
-        },
-        timeStamp: Math.floor(tsMs / 1000),
-      },
-    ],
+    parity: base.parity || "SafeSend parity",
   };
 }
 
-function stubNeighbors(address, network) {
-  const center = (address || "").toLowerCase();
-  const n = 10;
-  const nodes = [{ id: center, address: center, network }];
+/* ====================== NEIGHBORS ======================== */
+
+async function fetchNeighbors(address, network, { hop = 1, limit = 250 } = {}) {
+  if (!CFG.apiBase) return stubNeighbors(address);
+
+  const url = `${CFG.apiBase}/neighbors?address=${encodeURIComponent(
+    address
+  )}&network=${encodeURIComponent(network)}&hop=${hop}&limit=${limit}`;
+
+  const r = await fetch(url, {
+    headers: { accept: "application/json" },
+    cf: { cacheTtl: 0 },
+  });
+
+  if (!r.ok) return stubNeighbors(address);
+  const raw = await r.json().catch(() => ({}));
+
+  const nodes = [];
   const links = [];
 
-  for (let i = 0; i < n; i++) {
-    const id =
-      "0x" + Math.random().toString(16).slice(2).padStart(40, "0").slice(0, 40);
-    nodes.push({ id, address: id, network });
-    links.push({ a: center, b: id, weight: 1 });
+  const pushNode = (n) => {
+    const id = String(n?.id || n?.address || n?.addr || "").toLowerCase();
+    if (!id) return;
+    nodes.push({ id, address: id, network, ...n });
+  };
+  const pushLink = (L) => {
+    const a = String(
+      L?.a ?? L?.source ?? L?.idA ?? L?.from ?? ""
+    ).toLowerCase();
+    const b = String(
+      L?.b ?? L?.target ?? L?.idB ?? L?.to ?? ""
+    ).toLowerCase();
+    if (!a || !b || a === b) return;
+    links.push({ a, b, weight: Number(L?.weight ?? 1) || 1 });
+  };
+
+  if (Array.isArray(raw?.nodes)) raw.nodes.forEach(pushNode);
+  if (Array.isArray(raw?.links)) raw.links.forEach(pushLink);
+
+  // Fallback if the API returns only edges
+  if (!nodes.length && Array.isArray(raw)) {
+    const set = new Set();
+    for (const L of raw) {
+      const a = String(
+        L?.a ?? L?.source ?? L?.from ?? L?.idA ?? ""
+      ).toLowerCase();
+      const b = String(
+        L?.b ?? L?.target ?? L?.to ?? L?.idB ?? ""
+      ).toLowerCase();
+      if (a) set.add(a);
+      if (b) set.add(b);
+      pushLink(L);
+    }
+    set.forEach((id) => nodes.push({ id, address: id, network }));
   }
+
+  if (!nodes.length && !links.length) return stubNeighbors(address);
 
   return { nodes, links };
 }
 
-/* ====================== WORKER ROUTER ====================== */
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const { pathname, searchParams } = url;
-
-    if (request.method === "OPTIONS") {
-      return handleOptions();
-    }
-
-    // Health
-    if (pathname === "/" || pathname === "/health") {
-      return jsonResponse({
-        ok: true,
-        service: "riskxlabs-vision-api",
-        version: VERSION,
-      });
-    }
-
-    if (pathname === "/score" || pathname === "/check") {
-      const address = searchParams.get("address") || "";
-      const network = searchParams.get("network") || "eth";
-      if (!address) {
-        return jsonResponse(
-          { ok: false, error: "Missing address" },
-          400
-        );
-      }
-      const payload = scoreAddress(address, network);
-      return jsonResponse(payload);
-    }
-
-    if (pathname === "/txs") {
-      const address = searchParams.get("address") || "";
-      const network = searchParams.get("network") || "eth";
-      const data = stubTxs(address, network);
-      return jsonResponse(data);
-    }
-
-    if (pathname === "/neighbors") {
-      const address = searchParams.get("address") || "";
-      const network = searchParams.get("network") || "eth";
-      const data = stubNeighbors(address, network);
-      return jsonResponse(data);
-    }
-
-    return textResponse("Not found", 404);
-  },
-};
+function stubNeighbors(center) {
+  const centerId = String(center || "").toLowerCase() || "0xseed";
+  const n = 10;
+  const nodes = [{ id: centerId, address: centerId, network: CFG.network }];
+  const links = [];
+  for (let i = 0; i < n; i++) {
+    const id = `0x${Math.random()
+      .toString(16)
+      .slice(2)
+      .padStart(40, "0")
+      .slice(0, 40)}`;
+    nodes.push({ id, address: id, network: CFG.network });
+    links.push({ a: centerId, b: id, weight: 1 });
+  }
+  return { nodes, links };
+}
