@@ -26,9 +26,9 @@ export default {
         const network = (url.searchParams.get("network") || "eth").toLowerCase();
         if (!address) return json({ error: "missing address" }, 400);
 
-        const ofacSet = parseHexSet(env.OFAC_ETH_WALLETS);
-        const scamSet = parseHexSet(env.SCAM_ETH_WALLETS);
-        const tornadoSet = parseHexSet(env.TORNADO_ETH_WALLETS);
+        const ofacSet = parseHexSet(env.OFAC_SET);
+        const scamSet = parseHexSet(env.SCAM_CLUSTERS);
+        const tornadoSet = parseHexSet(env.TORNADO_SET);
 
         // 1) Get txs (real if possible, otherwise synthetic)
         const { txs, source } = await fetchTxs(address, network, env);
@@ -134,8 +134,8 @@ async function fetchTxs(address, network, env, { debug = false } = {}) {
     return { txs: [], source: "unsupported-network" };
   }
 
-  const etherscanKey = env.ETHERSCAN_MAIN_API_KEY;
-  const alchemyKey = env.ALCHEMY_MAIN_API_KEY;
+  const etherscanKey = env.ETHERSCAN_API_KEY;
+  const alchemyKey = env.ALCHEMY_API_KEY;
 
   // 1) Try Etherscan
   if (etherscanKey) {
