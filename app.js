@@ -1,3 +1,4 @@
+console.log('[Vision] app.js loaded v1.6.2');
 // app.js — Vision 1_5_RE / 1_6 shell
 // Front-end controller: graph + worker + narrative + controls
 
