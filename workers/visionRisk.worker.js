@@ -1,6 +1,8 @@
-/ workers/visionRisk.worker.js
-// Vision v1.6 — front-end worker that calls the Cloudflare risk engine
+// workers/visionRisk.worker.js
+// Vision v1.6.2 — front-end worker that calls the Cloudflare risk engine
 // and handles neighbor fetching / batching for the graph.
+
+console.log('[visionWorker] booting v1.6.2');
 
 let CFG = {
   apiBase: "",
@@ -21,6 +23,8 @@ const neighborCache = new Map();  // key: `${network}:${address}` → {nodes,lin
 
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
+  // This log will only show in the worker console context
+  console.log('[visionWorker] onmessage', type, payload);
 
   try {
     if (type === 'INIT') {
@@ -29,6 +33,7 @@ self.onmessage = async (e) => {
       if (payload?.concurrency) CFG.concurrency = payload.concurrency;
       if (payload?.flags) CFG.flags = { ...CFG.flags, ...payload.flags };
 
+      console.log('[visionWorker] INIT cfg=', CFG);
       post({ id, type: 'INIT_OK' });
       return;
     }
@@ -42,6 +47,8 @@ self.onmessage = async (e) => {
 
     if (type === 'SCORE_BATCH') {
       const items = Array.isArray(payload?.items) ? payload.items : [];
+      console.log('[visionWorker] SCORE_BATCH', items.length);
+
       for (const it of items) {
         const r = await scoreOne(it);
         post({ type: 'RESULT_STREAM', data: r });
@@ -65,7 +72,7 @@ self.onmessage = async (e) => {
 
     throw new Error(`unknown type: ${type}`);
   } catch (err) {
-    console.error('[worker] error', type, err);
+    console.error('[visionWorker] error inside handler', type, err);
     post({ id, type: 'ERROR', error: String(err?.message || err) });
   }
 };
@@ -89,13 +96,15 @@ async function scoreOne(item) {
 
   // cache hit
   const cached = scoreCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+    console.log('[visionWorker] SCORE_ONE cache hit', cacheKey);
+    return cached;
+  }
 
   if (!CFG.apiBase) throw new Error('scoreOne: apiBase not configured');
 
   const url = `${CFG.apiBase}/score?address=${encodeURIComponent(id)}&network=${encodeURIComponent(network)}`;
-  // Debug: you can watch these in DevTools → Console
-  console.debug('[worker] SCORE_ONE →', url);
+  console.log('[visionWorker] SCORE_ONE →', url);
 
   const r = await fetch(url, {
     headers: { 'accept': 'application/json' }
@@ -123,42 +132,43 @@ async function scoreOne(item) {
 async function getNeighbors(address, network, { hop = 1, limit = 120 } = {}) {
   const addr = String(address || '').toLowerCase();
   if (!addr) throw new Error('neighbors: empty address');
+
   const key = `${network}:${addr}`;
   const now = Date.now();
   const ttl = CFG.flags.cacheNeighborsTTL || 600000;
 
   const cached = neighborCache.get(key);
   if (cached && (now - cached.ts) < ttl) {
+    console.log('[visionWorker] neighbors cache hit', key);
     return cached.data;
   }
 
   if (!CFG.apiBase) {
-    // no backend route yet → stub
     const stub = stubNeighbors(addr, network);
     neighborCache.set(key, { ts: now, data: stub });
     return stub;
   }
 
   const url = `${CFG.apiBase}/neighbors?address=${encodeURIComponent(addr)}&network=${encodeURIComponent(network)}&hop=${hop}&limit=${limit}`;
-  console.debug('[worker] NEIGHBORS →', url);
+  console.log('[visionWorker] NEIGHBORS →', url);
 
   let data;
   try {
     const resp = await fetch(url, { headers: { 'accept': 'application/json' } });
     if (!resp.ok) {
-      console.warn('[worker] neighbors backend error', resp.status);
+      console.warn('[visionWorker] neighbors backend error', resp.status);
       data = stubNeighbors(addr, network);
     } else {
       const raw = await resp.json().catch(() => ({}));
       data = normalizeNeighbors(raw, addr, network, limit);
     }
   } catch (e) {
-    console.warn('[worker] neighbors fetch failed, using stub', e);
+    console.warn('[visionWorker] neighbors fetch failed, using stub', e);
     data = stubNeighbors(addr, network);
   }
 
   neighborCache.set(key, { ts: now, data });
-  console.debug('[worker] neighbors(final)', {
+  console.log('[visionWorker] neighbors(final)', {
     addr,
     totalNeighbors: (data.nodes?.length || 1) - 1,
     shown: (data.nodes?.length || 1) - 1,
@@ -218,7 +228,7 @@ function normalizeNeighbors(raw, centerId, network, limit) {
   }
   for (const n of finalNodes) {
     if (n.id !== center && !existing.has(n.id)) {
-      links.push({ a: center, b: n.id, weight: 1 });
+      links.push({ a: center.id, b: n.id, weight: 1 });
     }
   }
 
