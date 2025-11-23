@@ -18,6 +18,14 @@ const RXL_FLAGS = Object.freeze({
 
 const worker = new Worker('./workers/visionRisk.worker.js', { type: 'module' });
 
+// Surface any worker boot / runtime issues into the main console
+worker.onerror = (err) => {
+  console.error('[Vision] worker error', err.message || err);
+};
+worker.onmessageerror = (err) => {
+  console.error('[Vision] worker message error', err);
+};
+
 const pending = new Map();
 function post(type, payload) {
   return new Promise((resolve, reject) => {
@@ -33,6 +41,7 @@ worker.onmessage = (e) => {
 
   if (type === 'INIT_OK') {
     if (req) { req.resolve(true); pending.delete(id); }
+    console.log('[Vision] worker INIT_OK');
     return;
   }
 
@@ -68,7 +77,7 @@ worker.onmessage = (e) => {
   }
 
   if (type === 'ERROR') {
-    console.error(error);
+    console.error('[Vision] worker ERROR', error);
     if (req) { req.reject(new Error(error)); pending.delete(id); }
     updateBatchStatus('Batch: error');
     setNeighborStatus('Error loading neighbors');
@@ -159,10 +168,11 @@ function normalizeResult(res = {}) {
 
 /* ================= Init =========================================== */
 
-async function init() {
-  document.title = 'RiskXLabs — Vision 1_5_RE';
+function init() {
+  document.title = 'RiskXLabs — Vision 1_6_RE';
+  console.log('[Vision] init() starting', window.VisionConfig);
 
-  await post('INIT', {
+  post('INIT', {
     apiBase: (window.VisionConfig && window.VisionConfig.API_BASE) || "",
     cache: window.RiskCache,
     network: getNetwork(),
@@ -174,11 +184,20 @@ async function init() {
       neighborStats: true,
       cacheNeighborsTTL: 600000 // 10 min
     }
-  });
-
-  bindUI();
-  applyFeatureTogglesFromUI();
-  seedDemo();
+  })
+    .then(() => {
+      console.log('[Vision] worker INIT_OK (promise resolved)');
+    })
+    .catch((err) => {
+      console.error('[Vision] worker INIT failed', err);
+      updateBatchStatus('Worker init error');
+    })
+    .finally(() => {
+      // Even if INIT fails, we still wire the UI so clicks do *something*
+      bindUI();
+      applyFeatureTogglesFromUI();
+      seedDemo();
+    });
 }
 init();
 
@@ -205,12 +224,15 @@ function bindUI() {
     const seedRaw = document.getElementById('seedInput').value.trim();
     if (!seedRaw) return;
     const seed = normId(seedRaw);
+    console.log('[Vision] Load seed clicked', seed);
     pushNav(seed);
     centerOnSeedAndLoad(seed);
   });
 
   document.getElementById('networkSelect')?.addEventListener('change', async () => {
-    await post('INIT', { network: getNetwork() });
+    await post('INIT', { network: getNetwork() }).catch(err => {
+      console.error('[Vision] network INIT failed', err);
+    });
     scoreVisible();
   });
 
@@ -219,6 +241,7 @@ function bindUI() {
     window.graph.on('selectNode', (n) => {
       if (!n) return;
       const id = normId(n.id);
+      console.log('[Vision] graph selectNode', id);
       pushNav(id);
       centerOnSeedAndLoad(id);
     });
@@ -234,6 +257,7 @@ function bindUI() {
     if (navIndex > 0) {
       navIndex--;
       const id = navHistory[navIndex];
+      console.log('[Vision] navBack →', id);
       centerOnSeedAndLoad(id, { pushHistory: false });
     }
   });
@@ -241,6 +265,7 @@ function bindUI() {
     if (navIndex < navHistory.length - 1) {
       navIndex++;
       const id = navHistory[navIndex];
+      console.log('[Vision] navForward →', id);
       centerOnSeedAndLoad(id, { pushHistory: false });
     }
   });
@@ -299,9 +324,13 @@ function pushNav(id){
   navIndex = navHistory.length - 1;
 }
 
+/* centerOnSeedAndLoad — single entry point when a wallet becomes "focus" */
+
 async function centerOnSeedAndLoad(seed, opts = {}) {
   const network = getNetwork();
   setSelected(seed);
+  console.log('[Vision] centerOnSeedAndLoad', { seed, network });
+
   // Replace graph with centered node while loading neighbors
   setGraphData({ nodes:[{ id: seed, address: seed, network }], links:[] });
   setNeighborStatusLoading();
@@ -310,14 +339,19 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
   post('SCORE_ONE', { item: { type:'address', id: seed, network } })
     .then(r => {
       const rr = normalizeResult(r);
+      console.log('[Vision] SCORE_ONE result', rr);
       updateScorePanel(rr);
       applyVisualCohesion(rr);
       renderNarrativePanelIfEnabled(rr);
     })
-    .catch(()=>{});
+    .catch((err)=>{
+      console.error('[Vision] SCORE_ONE failed', err);
+      updateBatchStatus('Score error');
+    });
 
   // Neighbors
-  refreshGraphFromLive(seed).catch(()=>{
+  refreshGraphFromLive(seed).catch((err)=>{
+    console.error('[Vision] neighbors failed', err);
     setNeighborStatus('Neighbors: unavailable');
   });
 
@@ -378,13 +412,16 @@ function updateScorePanel(res) {
   const neighborLine = `Neighbors flagged: <b>${neighPct}</b>` +
     (typeof neighCount === 'number' ? ` (${neighCount} neighbors)` : '');
 
-  document.getElementById('entityMeta').innerHTML = `
-    <div>Address: <b>${res.id}</b></div>
-    <div>Network: <b>${res.network}</b></div>
-    <div>Age: <b>${ageDisplay}</b></div>
-    <div>Mixer taint: <b>${mixerPct}</b></div>
-    <div>${neighborLine}</div>
-  `;
+  const metaEl = document.getElementById('entityMeta');
+  if (metaEl) {
+    metaEl.innerHTML = `
+      <div>Address: <b>${res.id}</b></div>
+      <div>Network: <b>${res.network}</b></div>
+      <div>Age: <b>${ageDisplay}</b></div>
+      <div>Mixer taint: <b>${mixerPct}</b></div>
+      <div>${neighborLine}</div>
+    `;
+  }
 }
 
 /* ================= Unified visuals (halo + ring) ================= */
@@ -489,7 +526,9 @@ async function getNeighborsLive(centerId){
       limit: (window.VisionConfig?.GRAPH?.neighborLimit || 120)
     });
     if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
-  } catch {}
+  } catch (err) {
+    console.error('[Vision] getNeighborsLive failed', err);
+  }
   return { nodes: [], links: [] };
 }
 
