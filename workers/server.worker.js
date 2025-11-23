@@ -1,5 +1,5 @@
 // server.worker.js — RiskXLabs Vision API (single-file Cloudflare worker)
-// Version: RXL-V1.6.2
+// Version: RXL-V1.6.3
 //
 // Endpoints:
 //   GET /                   → health/info
@@ -8,15 +8,13 @@
 //   GET /neighbors?address=&network=eth&hop=1&limit=120
 //
 // Secrets used (set in Cloudflare):
-//   RXL_OFAC_SET      → newline/space/comma-separated OFAC addresses (lower/upper ok)
-//   RXL_TORNADO_SET   → Tornado/mixer addresses
-//   RXL_SCAM_SET      → scam/platform clusters
-//
-// NOTE: This is a single-file version (no imports) so it can run directly
-// in the Cloudflare dashboard. Your GitHub repo can still keep a modular
-// lib/risk-model.js for future Wrangler-based deployment.
+//   RXL_OFAC_SET        → newline/space/comma-separated OFAC addresses
+//   RXL_TORNADO_SET     → Tornado/mixer addresses
+//   RXL_SCAM_SET        → scam/platform clusters
+//   ETHERSCAN_MAINNET_KEY / ETHERSCAN_API_KEY / ETHERSCAN_KEY
+//                        → Etherscan key for mainnet (used for neighbors)
 
-const VERSION = "RXL-V1.6.2";
+const VERSION = "RXL-V1.6.3";
 
 export default {
   async fetch(request, env, ctx) {
@@ -84,9 +82,8 @@ async function handleScore(url, env) {
   const isMixer = tornadoSet.has(address);
   const isScam = scamSet.has(address);
 
-  // --- Synthetic behavioral features (fallback for now) ---
-  // These are the same baseline values you've been seeing (score ~ 28) so
-  // the frontend behavior stays stable while we wire live chain data later.
+  // --- Synthetic behavioral features (for now) ---
+  // These keep your non-OFAC score ~28 until we wire live chain features.
   const feats = {
     ageDays: 1309,
     firstSeenMs: null,
@@ -113,7 +110,7 @@ async function handleScore(url, env) {
     },
   };
 
-  // --- Core ensemble scoring (matches your previous 28 behavior) ----
+  // --- Core ensemble scoring (same as before, ~28 baseline) ----
   const baseScore = 15;
 
   const ageImpact = (() => {
@@ -121,7 +118,7 @@ async function handleScore(url, env) {
     if (feats.ageDays < 30) return +15;
     if (feats.ageDays < 180) return +8;
     if (feats.ageDays < 730) return 0;
-    return -10; // old wallet → some risk relief
+    return -10;
   })();
 
   const velocityImpact = (() => {
@@ -139,7 +136,7 @@ async function handleScore(url, env) {
     if (u === 0) return 0;
     if (top > 0.6) return +8;
     if (top > 0.3) return +4;
-    return -2; // diversified → slight relief
+    return -2;
   })();
 
   const neighborImpact = (() => {
@@ -327,7 +324,6 @@ async function handleScore(url, env) {
     },
   };
 
-  // Convenience: mirror final score at top level for UI
   result.score = score;
 
   return json(result);
@@ -337,7 +333,7 @@ async function handleScore(url, env) {
 
 async function handleNeighbors(url, env) {
   const center = normalizeAddress(url.searchParams.get("address"));
-  const network = url.searchParams.get("network") || "eth";
+  const network = (url.searchParams.get("network") || "eth").toLowerCase();
   const limit = Number(url.searchParams.get("limit") || "120") || 120;
 
   if (!center) {
@@ -347,27 +343,121 @@ async function handleNeighbors(url, env) {
     );
   }
 
-  // For now: synthetic neighborhood (same as previous behavior).
-  // This keeps Vision working while we later plug a real graph source.
+  // Prefer live Etherscan neighbors for Ethereum mainnet
+  const key =
+    env.ETHERSCAN_MAINNET_KEY ||
+    env.ETHERSCAN_API_KEY ||
+    env.ETHERSCAN_KEY ||
+    null;
+
+  if (network === "eth" && key) {
+    try {
+      const live = await fetchNeighborsFromEtherscan(center, key, limit);
+      if (live && live.nodes && live.nodes.length > 1) {
+        return json(live);
+      }
+    } catch (err) {
+      console.error("neighbors: etherscan failed, falling back to stub:", err);
+    }
+  }
+
+  // Fallback: synthetic neighborhood (same shape as before)
+  const stub = stubNeighbors(center, network, limit);
+  return json(stub);
+}
+
+// Build neighbor graph from Etherscan tx history (simple one-hop view)
+async function fetchNeighborsFromEtherscan(center, apiKey, limit) {
+  const base = "https://api.etherscan.io/api";
+  const params = new URLSearchParams({
+    module: "account",
+    action: "txlist",
+    address: center,
+    startblock: "0",
+    endblock: "99999999",
+    sort: "desc",
+    page: "1",
+    offset: "200", // up to 200 recent txs
+    apikey: apiKey,
+  });
+
+  const res = await fetch(`${base}?${params.toString()}`);
+  if (!res.ok) throw new Error(`etherscan status ${res.status}`);
+  const data = await res.json();
+  if (!data || data.status === "0" || !Array.isArray(data.result)) {
+    throw new Error("etherscan empty or error");
+  }
+
+  const txs = data.result;
+  const neighborsMap = new Map(); // addr → {count, totalValue}
+
+  for (const tx of txs) {
+    const from = normalizeAddress(tx.from);
+    const to = normalizeAddress(tx.to);
+    if (!from || !to) continue;
+
+    let neighbor = null;
+    if (from === center && to && to !== center) {
+      neighbor = to;
+    } else if (to === center && from && from !== center) {
+      neighbor = from;
+    }
+    if (!neighbor) continue;
+
+    const prev = neighborsMap.get(neighbor) || { count: 0, total: 0 };
+    const val = Number(tx.value || "0");
+    prev.count += 1;
+    if (Number.isFinite(val)) prev.total += val;
+    neighborsMap.set(neighbor, prev);
+  }
+
+  if (neighborsMap.size === 0) {
+    // Let caller fall back to stub
+    throw new Error("no neighbors from etherscan");
+  }
+
+  // Sort by count desc and cap to limit
+  const sorted = Array.from(neighborsMap.entries())
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, limit);
+
   const nodes = [];
   const links = [];
 
+  nodes.push({ id: center, address: center, network: "eth" });
+
+  for (const [addr, stats] of sorted) {
+    nodes.push({
+      id: addr,
+      address: addr,
+      network: "eth",
+      txCountWithCenter: stats.count,
+      rawValueWithCenter: stats.total,
+    });
+    links.push({
+      a: center,
+      b: addr,
+      weight: stats.count,
+    });
+  }
+
+  return { nodes, links };
+}
+
+function stubNeighbors(center, network, limit) {
+  const nodes = [];
+  const links = [];
   nodes.push({ id: center, address: center, network });
 
   const count = Math.min(limit, 16);
   for (let i = 0; i < count; i++) {
     const id =
       "0x" +
-      Math.random()
-        .toString(16)
-        .slice(2)
-        .padStart(40, "0")
-        .slice(0, 40);
+      Math.random().toString(16).slice(2).padStart(40, "0").slice(0, 40);
     nodes.push({ id, address: id, network });
     links.push({ a: center, b: id, weight: 1 });
   }
-
-  return json({ nodes, links });
+  return { nodes, links };
 }
 
 /* ====================== Helpers ================================ */
