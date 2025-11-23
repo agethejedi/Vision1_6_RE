@@ -1,480 +1,584 @@
-// server.worker.js — RiskXLabs Vision API (single-file Cloudflare worker)
-// Version: RXL-V1.6.3
+// server.worker.js — RiskXLabs Vision API
+// Version: RXL-V1.6.2
 //
-// Endpoints:
-//   GET /                   → health/info
-//   GET /health             → health/info
-//   GET /score?address=&network=eth
-//   GET /neighbors?address=&network=eth&hop=1&limit=120
+// Routes:
+//   GET /               → service info
+//   GET /health         → health ping
+//   GET /score          → risk score for address
+//   GET /neighbors      → neighbor graph from tx history
 //
-// Secrets used (set in Cloudflare):
-//   RXL_OFAC_SET        → newline/space/comma-separated OFAC addresses
-//   RXL_TORNADO_SET     → Tornado/mixer addresses
-//   RXL_SCAM_SET        → scam/platform clusters
-//   ETHERSCAN_MAINNET_KEY / ETHERSCAN_API_KEY / ETHERSCAN_KEY
-//                        → Etherscan key for mainnet (used for neighbors)
-
-const VERSION = "RXL-V1.6.3";
+// Secrets / Vars expected in Cloudflare:
+//   ALCHEMY_API_KEY           (Secret)
+//   ETHERSCAN_API_KEY         (Secret)
+//   OFAC_SET                  (Plaintext, comma/newline separated addresses)
+//   TORNADO_SET               (Plaintext, comma/newline separated addresses)
+//   SCAM_CLUSTERS             (Plaintext, comma/newline separated addresses)
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-
     try {
-      if (path === "/" || path === "/health") {
+      const url = new URL(request.url);
+      const path = url.pathname.replace(/\/+$/, "") || "/";
+
+      if (path === "/") {
         return json({
           ok: true,
           service: "riskxlabs-vision-api",
-          version: VERSION,
+          version: "RXL-V1.6.2"
         });
       }
 
+      if (path === "/health") {
+        return json({ ok: true, status: "healthy", ts: Date.now() });
+      }
+
       if (path === "/score") {
-        return handleScore(url, env);
+        const address = (url.searchParams.get("address") || "").toLowerCase();
+        const network = (url.searchParams.get("network") || "eth").toLowerCase();
+        if (!address) {
+          return json({ ok: false, error: "missing address" }, 400);
+        }
+        const result = await handleScore(address, network, env);
+        return json(result);
       }
 
       if (path === "/neighbors") {
-        return handleNeighbors(url, env);
+        const address = (url.searchParams.get("address") || "").toLowerCase();
+        const network = (url.searchParams.get("network") || "eth").toLowerCase();
+        const limit = Number(url.searchParams.get("limit") || "120") || 120;
+        if (!address) {
+          return json({ ok: false, error: "missing address" }, 400);
+        }
+        const graph = await handleNeighbors(address, network, env, { limit });
+        return json(graph);
       }
 
-      return new Response("Not found", { status: 404 });
+      return json({ ok: false, error: "Not found" }, 404);
     } catch (err) {
-      console.error("RXL server error:", err);
+      console.error("top-level error", err);
       return json({ ok: false, error: String(err?.message || err) }, 500);
     }
-  },
+  }
 };
 
-/* ====================== /score handler ======================= */
+/* ====================================================================== */
+/* ========================= SCORE HANDLER =============================== */
+/* ====================================================================== */
 
-function normalizeAddress(addr) {
-  return String(addr || "").trim().toLowerCase();
-}
+async function handleScore(address, network, env) {
+  const now = Date.now();
 
-function parseSet(secretValue) {
-  if (!secretValue) return new Set();
-  return new Set(
-    String(secretValue)
-      .split(/[\s,]+/)
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-  );
-}
+  // --- Load list sets from *actual* CF secret names ---
+  const ofacSet     = parseSet(env.OFAC_SET);
+  const tornadoSet  = parseSet(env.TORNADO_SET);
+  const scamSet     = parseSet(env.SCAM_CLUSTERS);
 
-async function handleScore(url, env) {
-  const address = normalizeAddress(url.searchParams.get("address"));
-  const network = url.searchParams.get("network") || "eth";
+  // --- Fetch tx history (Etherscan → Alchemy fallback) ---
+  const txs = await fetchTxHistory(address, network, env, 100);
 
-  if (!address || !address.startsWith("0x") || address.length < 10) {
-    return json(
-      { ok: false, error: "Invalid or missing address", address, network },
-      400
-    );
-  }
+  // --- Derive behavioral features ---
+  const feats = deriveFeaturesFromTxs(txs, now);
 
-  // --- Load list sets from secrets ---
-  const ofacSet = parseSet(env.RXL_OFAC_SET);
-  const tornadoSet = parseSet(env.RXL_TORNADO_SET);
-  const scamSet = parseSet(env.RXL_SCAM_SET);
+  // --- List-based signals ---
+  const addrLower = address.toLowerCase();
+  const ofacHit   = ofacSet.has(addrLower);
+  const inTornado = tornadoSet.has(addrLower);
+  const inScam    = scamSet.has(addrLower);
 
-  const isOfac = ofacSet.has(address);
-  const isMixer = tornadoSet.has(address);
-  const isScam = scamSet.has(address);
+  // --- Risk model (simple but deterministic) ---
+  const { score, reasons, parts } = computeRisk(feats, {
+    ofacHit,
+    inTornado,
+    inScam
+  });
 
-  // --- Synthetic behavioral features (for now) ---
-  // These keep your non-OFAC score ~28 until we wire live chain features.
-  const feats = {
-    ageDays: 1309,
-    firstSeenMs: null,
-    txCount: 809,
-    activeDays: 30,
-    txPerDay: 26.966666666666665,
-    burstScore: 0.51,
-    uniqueCounterparties: 10,
-    topCounterpartyShare: 0.02,
-    isDormant: false,
-    dormantDays: 0,
-    resurrectedRecently: false,
-    neighborCount: 9,
-    sanctionedNeighborRatio: 0.28,
-    highRiskNeighborRatio: 0.32,
-    dormantNeighborRatio: 0,
-    mixerProximity: isMixer ? 0.9 : 0.42,
-    custodianExposure: 0.38,
-    scamPlatformExposure: isScam ? 0.9 : 0.49,
-    local: {
-      riskyNeighborRatio: 0.32,
-      neighborAvgTx: 26.966666666666665,
-      neighborAvgAgeDays: 1309,
+  const block = !!(ofacHit || inTornado || score >= 95);
+  const sanctionHits = ofacHit ? 1 : 0;
+
+  const explain = {
+    version: "RXL-V1.6.2",
+    address,
+    network,
+    baseScore: parts.baseScore ?? 0,
+    rawContribution: parts.rawContribution ?? 0,
+    score,
+    confidence: parts.confidence ?? 1,
+    parts,
+    feats,
+    signals: {
+      ofacHit,
+      chainabuse: false,
+      caFraud: false,
+      scamPlatform: inScam,
+      mixer: inTornado,
+      custodian: false,
+      unifiedSanctions: null,
+      chainalysis: null,
+      scorechain: null
     },
+    notes: []
   };
 
-  // --- Core ensemble scoring (same as before, ~28 baseline) ----
-  const baseScore = 15;
-
-  const ageImpact = (() => {
-    if (feats.ageDays == null) return 0;
-    if (feats.ageDays < 30) return +15;
-    if (feats.ageDays < 180) return +8;
-    if (feats.ageDays < 730) return 0;
-    return -10;
-  })();
-
-  const velocityImpact = (() => {
-    const tpd = feats.txPerDay || 0;
-    const burst = feats.burstScore || 0;
-    if (tpd === 0) return 0;
-    if (tpd > 20 || burst > 0.5) return +20;
-    if (tpd > 5) return +10;
-    return +3;
-  })();
-
-  const mixImpact = (() => {
-    const u = feats.uniqueCounterparties || 0;
-    const top = feats.topCounterpartyShare || 0;
-    if (u === 0) return 0;
-    if (top > 0.6) return +8;
-    if (top > 0.3) return +4;
-    return -2;
-  })();
-
-  const neighborImpact = (() => {
-    const high = feats.highRiskNeighborRatio || 0;
-    const sanc = feats.sanctionedNeighborRatio || 0;
-    if (sanc > 0.2 || high > 0.3) return +5;
-    if (sanc > 0 || high > 0.1) return +2;
-    return 0;
-  })();
-
-  const dormantImpact = (() => {
-    if (!feats.isDormant) return 0;
-    if (feats.dormantDays > 365 && feats.resurrectedRecently) return +10;
-    if (feats.dormantDays > 180) return +5;
-    return +2;
-  })();
-
-  const listImpact = (() => {
-    let s = 0;
-    if (isMixer) s += 15;
-    if (isScam) s += 15;
-    return s;
-  })();
-
-  const rawContribution =
-    ageImpact +
-    velocityImpact +
-    mixImpact +
-    neighborImpact +
-    dormantImpact +
-    listImpact;
-
-  let score = clamp01((baseScore + rawContribution) / 100) * 100;
-
-  // --- Hard OFAC override ---
-  let block = false;
-  let sanctionHits = null;
-  const reasons = [
-    "Transaction velocity & bursts",
-    "Wallet age",
-    "Neighbor & cluster risk",
-    "Counterparty mix & concentration",
-  ];
-
-  if (isOfac) {
-    score = 100;
-    block = true;
-    sanctionHits = 1;
-    reasons.push("OFAC / sanctions list match");
-  } else {
-    if (isMixer) reasons.push("Mixer proximity");
-    if (isScam) reasons.push("Scam / fraud platform exposure");
-  }
-
-  score = Math.round(score);
-
-  const result = {
+  return {
     address,
     network,
     risk_score: score,
     reasons,
-    risk_factors: reasons.slice(),
+    risk_factors: reasons,
     block,
     sanctionHits,
     feats,
-    explain: {
-      version: VERSION,
-      address,
-      network,
-      baseScore,
-      rawContribution,
-      score,
-      confidence: 1,
-      parts: {
-        age: {
-          id: "age",
-          label: "Wallet age",
-          impact: ageImpact,
-          details: {
-            ageDays: feats.ageDays,
-            bucket:
-              feats.ageDays == null
-                ? "unknown"
-                : feats.ageDays < 30
-                ? "< 30 days"
-                : feats.ageDays < 180
-                ? "< 6 months"
-                : feats.ageDays < 730
-                ? "< 2 years"
-                : "> 2 years",
-          },
-        },
-        velocity: {
-          id: "velocity",
-          label: "Transaction velocity & bursts",
-          impact: velocityImpact,
-          details: {
-            txPerDay: feats.txPerDay,
-            burstScore: feats.burstScore,
-            bucket:
-              feats.txPerDay === 0
-                ? "inactive"
-                : feats.txPerDay > 20 || feats.burstScore > 0.5
-                ? "extreme"
-                : feats.txPerDay > 5
-                ? "elevated"
-                : "normal",
-          },
-        },
-        mix: {
-          id: "mix",
-          label: "Counterparty mix & concentration",
-          impact: mixImpact,
-          details: {
-            uniqueCounterparties: feats.uniqueCounterparties,
-            topCounterpartyShare: feats.topCounterpartyShare,
-            bucket:
-              feats.uniqueCounterparties === 0
-                ? "unknown"
-                : feats.topCounterpartyShare > 0.6
-                ? "concentrated"
-                : feats.topCounterpartyShare > 0.3
-                ? "moderate concentration"
-                : "diversified",
-          },
-        },
-        concentration: {
-          id: "concentration",
-          label: "Flow concentration (fan-in/out)",
-          impact: 0,
-          details: {},
-        },
-        dormant: {
-          id: "dormant",
-          label: "Dormancy & resurrection patterns",
-          impact: dormantImpact,
-          details: {
-            isDormant: feats.isDormant,
-            dormantDays: feats.dormantDays,
-            resurrectedRecently: feats.resurrectedRecently,
-          },
-        },
-        neighbor: {
-          id: "neighbor",
-          label: "Neighbor & cluster risk",
-          impact: neighborImpact,
-          details: {
-            neighborCount: feats.neighborCount,
-            sanctionedNeighborRatio: feats.sanctionedNeighborRatio,
-            highRiskNeighborRatio: feats.highRiskNeighborRatio,
-            mixedCluster:
-              feats.sanctionedNeighborRatio > 0 || feats.highRiskNeighborRatio > 0,
-          },
-        },
-        lists: {
-          id: "lists",
-          label: "External fraud & platform signals",
-          impact: listImpact,
-          details: {
-            ofacHit: isOfac,
-            mixer: isMixer,
-            scamPlatform: isScam,
-          },
-        },
-        governance: {
-          id: "governance",
-          label: "Governance / override",
-          impact: 0,
-          details: {},
-        },
-      },
-      feats,
-      signals: {
-        ofacHit: isOfac,
-        chainabuse: false,
-        caFraud: false,
-        scamPlatform: isScam,
-        mixer: isMixer,
-        custodian: false,
-        unifiedSanctions: null,
-        chainalysis: null,
-        scorechain: null,
-      },
-      notes: [],
-    },
+    explain,
+    score // duplicate for convenience
   };
-
-  result.score = score;
-
-  return json(result);
 }
 
-/* ====================== /neighbors handler ===================== */
+/* ====================================================================== */
+/* ========================= NEIGHBORS HANDLER ========================== */
+/* ====================================================================== */
 
-async function handleNeighbors(url, env) {
-  const center = normalizeAddress(url.searchParams.get("address"));
-  const network = (url.searchParams.get("network") || "eth").toLowerCase();
-  const limit = Number(url.searchParams.get("limit") || "120") || 120;
+async function handleNeighbors(address, network, env, { limit = 120 } = {}) {
+  const txs = await fetchTxHistory(address, network, env, 250);
 
-  if (!center) {
-    return json(
-      { ok: false, error: "Missing address for neighbors", network },
-      400
-    );
+  if (!txs.length) {
+    // minimal stub if we truly have nothing
+    return stubNeighbors(address, network);
   }
 
-  // Prefer live Etherscan neighbors for Ethereum mainnet
-  const key =
-    env.ETHERSCAN_MAINNET_KEY ||
-    env.ETHERSCAN_API_KEY ||
-    env.ETHERSCAN_KEY ||
-    null;
+  const center = address.toLowerCase();
+  const nodes = new Map(); // id -> node
+  const links = [];
 
-  if (network === "eth" && key) {
-    try {
-      const live = await fetchNeighborsFromEtherscan(center, key, limit);
-      if (live && live.nodes && live.nodes.length > 1) {
-        return json(live);
-      }
-    } catch (err) {
-      console.error("neighbors: etherscan failed, falling back to stub:", err);
-    }
-  }
-
-  // Fallback: synthetic neighborhood (same shape as before)
-  const stub = stubNeighbors(center, network, limit);
-  return json(stub);
-}
-
-// Build neighbor graph from Etherscan tx history (simple one-hop view)
-async function fetchNeighborsFromEtherscan(center, apiKey, limit) {
-  const base = "https://api.etherscan.io/api";
-  const params = new URLSearchParams({
-    module: "account",
-    action: "txlist",
-    address: center,
-    startblock: "0",
-    endblock: "99999999",
-    sort: "desc",
-    page: "1",
-    offset: "200", // up to 200 recent txs
-    apikey: apiKey,
-  });
-
-  const res = await fetch(`${base}?${params.toString()}`);
-  if (!res.ok) throw new Error(`etherscan status ${res.status}`);
-  const data = await res.json();
-  if (!data || data.status === "0" || !Array.isArray(data.result)) {
-    throw new Error("etherscan empty or error");
-  }
-
-  const txs = data.result;
-  const neighborsMap = new Map(); // addr → {count, totalValue}
+  // ensure center node
+  nodes.set(center, { id: center, address: center, network });
 
   for (const tx of txs) {
-    const from = normalizeAddress(tx.from);
-    const to = normalizeAddress(tx.to);
+    const from = (tx.from || "").toLowerCase();
+    const to   = (tx.to || "").toLowerCase();
     if (!from || !to) continue;
 
-    let neighbor = null;
-    if (from === center && to && to !== center) {
-      neighbor = to;
-    } else if (to === center && from && from !== center) {
-      neighbor = from;
+    const isFromCenter = from === center;
+    const isToCenter   = to === center;
+    if (!isFromCenter && !isToCenter) continue;
+
+    const neighborId = isFromCenter ? to : from;
+    if (!neighborId) continue;
+
+    if (!nodes.has(neighborId)) {
+      nodes.set(neighborId, { id: neighborId, address: neighborId, network });
     }
-    if (!neighbor) continue;
 
-    const prev = neighborsMap.get(neighbor) || { count: 0, total: 0 };
-    const val = Number(tx.value || "0");
-    prev.count += 1;
-    if (Number.isFinite(val)) prev.total += val;
-    neighborsMap.set(neighbor, prev);
-  }
-
-  if (neighborsMap.size === 0) {
-    // Let caller fall back to stub
-    throw new Error("no neighbors from etherscan");
-  }
-
-  // Sort by count desc and cap to limit
-  const sorted = Array.from(neighborsMap.entries())
-    .sort((a, b) => b[1].count - a[1].count)
-    .slice(0, limit);
-
-  const nodes = [];
-  const links = [];
-
-  nodes.push({ id: center, address: center, network: "eth" });
-
-  for (const [addr, stats] of sorted) {
-    nodes.push({
-      id: addr,
-      address: addr,
-      network: "eth",
-      txCountWithCenter: stats.count,
-      rawValueWithCenter: stats.total,
-    });
     links.push({
       a: center,
-      b: addr,
-      weight: stats.count,
+      b: neighborId,
+      weight: 1
     });
   }
 
-  return { nodes, links };
+  // limit neighbors
+  const allNodes = Array.from(nodes.values());
+  const neighbors = allNodes.filter(n => n.id !== center).slice(0, limit);
+  const neighborIds = new Set(neighbors.map(n => n.id));
+  const prunedLinks = links.filter(L => neighborIds.has(L.b) || neighborIds.has(L.a));
+
+  return {
+    nodes: [{ id: center, address: center, network }, ...neighbors],
+    links: prunedLinks
+  };
 }
 
-function stubNeighbors(center, network, limit) {
-  const nodes = [];
-  const links = [];
-  nodes.push({ id: center, address: center, network });
+/* ====================================================================== */
+/* ========================= TX HISTORY ================================= */
+/* ====================================================================== */
 
-  const count = Math.min(limit, 16);
-  for (let i = 0; i < count; i++) {
-    const id =
-      "0x" +
-      Math.random().toString(16).slice(2).padStart(40, "0").slice(0, 40);
-    nodes.push({ id, address: id, network });
-    links.push({ a: center, b: id, weight: 1 });
+async function fetchTxHistory(address, network, env, maxTx = 100) {
+  // 1) Try Etherscan
+  try {
+    const txs = await fetchFromEtherscan(address, network, env, maxTx);
+    if (txs && txs.length) {
+      return txs;
+    }
+  } catch (err) {
+    console.warn("Etherscan fetch failed, will try Alchemy:", err);
   }
-  return { nodes, links };
+
+  // 2) Fallback to Alchemy
+  try {
+    const txs = await fetchFromAlchemy(address, network, env, maxTx);
+    if (txs && txs.length) {
+      return txs;
+    }
+  } catch (err) {
+    console.warn("Alchemy fetch failed:", err);
+  }
+
+  // 3) If everything fails, return empty → model will fall back to synthetic
+  return [];
 }
 
-/* ====================== Helpers ================================ */
+async function fetchFromEtherscan(address, network, env, maxTx) {
+  const apiKey = env.ETHERSCAN_API_KEY;
+  if (!apiKey) return [];
 
-function clamp01(x) {
-  if (!Number.isFinite(x)) return 0;
-  if (x < 0) return 0;
-  if (x > 1) return 1;
-  return x;
+  // Only mainnet ETH for now; other networks can be added later.
+  const base = (network === "eth" || network === "ethereum")
+    ? "https://api.etherscan.io/api"
+    : null;
+
+  if (!base) return [];
+
+  const url = new URL(base);
+  url.searchParams.set("module", "account");
+  url.searchParams.set("action", "txlist");
+  url.searchParams.set("address", address);
+  url.searchParams.set("sort", "asc");
+  url.searchParams.set("page", "1");
+  url.searchParams.set("offset", String(maxTx));
+  url.searchParams.set("apikey", apiKey);
+
+  const resp = await fetch(url.toString(), { cf: { cacheTtl: 10, cacheEverything: false } });
+  if (!resp.ok) {
+    throw new Error(`etherscan status ${resp.status}`);
+  }
+
+  const body = await resp.json();
+  if (body.status !== "1" || !Array.isArray(body.result)) {
+    return [];
+  }
+
+  return body.result.map(tx => ({
+    hash: tx.hash,
+    from: tx.from,
+    to: tx.to,
+    timeStamp: Number(tx.timeStamp) || 0,
+    value: tx.value,
+    isError: tx.isError === "1"
+  }));
 }
+
+async function fetchFromAlchemy(address, network, env, maxTx) {
+  const apiKey = env.ALCHEMY_API_KEY;
+  if (!apiKey) return [];
+
+  // Only Ethereum mainnet for now
+  const base = (network === "eth" || network === "ethereum")
+    ? `https://eth-mainnet.g.alchemy.com/v2/${apiKey}`
+    : null;
+
+  if (!base) return [];
+
+  const body = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "alchemy_getAssetTransfers",
+    params: [{
+      fromBlock: "0x0",
+      toBlock: "latest",
+      fromAddress: address,
+      toAddress: address,
+      category: ["external", "internal", "erc20", "erc721", "erc1155"],
+      maxCount: "0x" + maxTx.toString(16),
+      withMetadata: false
+    }]
+  };
+
+  const resp = await fetch(base, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) throw new Error(`alchemy status ${resp.status}`);
+
+  const json = await resp.json();
+  const arr = json?.result?.transfers;
+  if (!Array.isArray(arr)) return [];
+
+  return arr.map(tx => ({
+    hash: tx.hash,
+    from: tx.from,
+    to: tx.to,
+    timeStamp: tx.metadata?.blockTimestamp
+      ? Math.floor(new Date(tx.metadata.blockTimestamp).getTime() / 1000)
+      : 0,
+    value: "0x0",
+    isError: false
+  }));
+}
+
+/* ====================================================================== */
+/* ========================= FEATURE DERIVATION ========================= */
+/* ====================================================================== */
+
+function deriveFeaturesFromTxs(txs, nowMs) {
+  if (!Array.isArray(txs) || !txs.length) {
+    // synthetic baseline — long-standing, low activity
+    return {
+      ageDays: 365,
+      firstSeenMs: null,
+      txCount: 0,
+      activeDays: 0,
+      txPerDay: 0,
+      burstScore: 0,
+      uniqueCounterparties: 0,
+      topCounterpartyShare: 0,
+      isDormant: false,
+      dormantDays: 0,
+      resurrectedRecently: false,
+      neighborCount: 0,
+      sanctionedNeighborRatio: 0,
+      highRiskNeighborRatio: 0,
+      dormantNeighborRatio: 0,
+      mixerProximity: 0,
+      custodianExposure: 0,
+      scamPlatformExposure: 0,
+      local: {
+        riskyNeighborRatio: 0,
+        neighborAvgTx: 0,
+        neighborAvgAgeDays: 0
+      }
+    };
+  }
+
+  const firstTs = Math.min(...txs.map(t => t.timeStamp || 0).filter(Boolean));
+  const lastTs  = Math.max(...txs.map(t => t.timeStamp || 0).filter(Boolean)) || firstTs;
+  const ageDays = firstTs
+    ? Math.max(0, (nowMs / 1000 - firstTs) / 86400)
+    : 0;
+
+  const spanDays = Math.max(1, (lastTs - firstTs) / 86400);
+  const txCount  = txs.length;
+  const txPerDay = txCount / spanDays;
+
+  // naive burst score: max tx per day vs avg
+  const countsByDay = new Map();
+  for (const tx of txs) {
+    const d = Math.floor((tx.timeStamp || firstTs) / 86400);
+    countsByDay.set(d, (countsByDay.get(d) || 0) + 1);
+  }
+  const maxPerDay = Math.max(...countsByDay.values());
+  const burstScore = txPerDay ? (maxPerDay / txPerDay) : 0;
+
+  // counterparty mix
+  const center = (txs[0].from || "").toLowerCase(); // heuristic; wallet address is passed separately anyway
+  const cpCounts = new Map();
+  for (const tx of txs) {
+    const from = (tx.from || "").toLowerCase();
+    const to   = (tx.to || "").toLowerCase();
+    let cp = null;
+    if (from === center && to) cp = to;
+    else if (to === center && from) cp = from;
+    if (!cp) continue;
+    cpCounts.set(cp, (cpCounts.get(cp) || 0) + 1);
+  }
+  const uniqueCounterparties = cpCounts.size;
+  let topCounterpartyShare = 0;
+  if (uniqueCounterparties > 0) {
+    const maxCount = Math.max(...cpCounts.values());
+    topCounterpartyShare = maxCount / txCount;
+  }
+
+  return {
+    ageDays,
+    firstSeenMs: firstTs ? firstTs * 1000 : null,
+    txCount,
+    activeDays: spanDays,
+    txPerDay,
+    burstScore,
+    uniqueCounterparties,
+    topCounterpartyShare,
+    isDormant: false,
+    dormantDays: 0,
+    resurrectedRecently: false,
+    neighborCount: uniqueCounterparties,
+    sanctionedNeighborRatio: 0,
+    highRiskNeighborRatio: 0,
+    dormantNeighborRatio: 0,
+    mixerProximity: 0,
+    custodianExposure: 0,
+    scamPlatformExposure: 0,
+    local: {
+      riskyNeighborRatio: 0,
+      neighborAvgTx: txPerDay,
+      neighborAvgAgeDays: ageDays
+    }
+  };
+}
+
+/* ====================================================================== */
+/* ========================= RISK MODEL ================================= */
+/* ====================================================================== */
+
+function computeRisk(feats, { ofacHit, inTornado, inScam }) {
+  let baseScore = 15;
+  let contribution = 0;
+  const parts = {};
+
+  // Age
+  let ageImpact = 0;
+  const age = feats.ageDays;
+  let ageBucket = "unknown";
+  if (age != null) {
+    if (age < 7)        { ageImpact = +25; ageBucket = "< 1 week"; }
+    else if (age < 30)  { ageImpact = +18; ageBucket = "1w–1m"; }
+    else if (age < 180) { ageImpact = +10; ageBucket = "1m–6m"; }
+    else if (age < 730) { ageImpact = +2;  ageBucket = "6m–2y"; }
+    else                { ageImpact = -8;  ageBucket = "> 2 years"; }
+  }
+  contribution += ageImpact;
+  parts.age = { id: "age", label: "Wallet age", impact: ageImpact, details: { ageDays: age, bucket: ageBucket } };
+
+  // Velocity / bursts
+  let velImpact = 0;
+  if (feats.txPerDay > 25 || feats.burstScore > 3) velImpact = +22;
+  else if (feats.txPerDay > 5 || feats.burstScore > 2) velImpact = +12;
+  else if (feats.txPerDay > 1) velImpact = +4;
+  contribution += velImpact;
+  parts.velocity = {
+    id: "velocity",
+    label: "Transaction velocity & bursts",
+    impact: velImpact,
+    details: {
+      txPerDay: feats.txPerDay,
+      burstScore: feats.burstScore,
+      bucket: velImpact >= 20 ? "extreme" : velImpact >= 10 ? "elevated" : "normal"
+    }
+  };
+
+  // Mix / concentration
+  let mixImpact = 0;
+  if (feats.uniqueCounterparties <= 2 && feats.txCount > 20) mixImpact = +14;
+  else if (feats.uniqueCounterparties <= 5 && feats.txCount > 50) mixImpact = +8;
+  else if (feats.uniqueCounterparties >= 20 && feats.topCounterpartyShare < 0.2) mixImpact = -4;
+  contribution += mixImpact;
+  parts.mix = {
+    id: "mix",
+    label: "Counterparty mix & concentration",
+    impact: mixImpact,
+    details: {
+      uniqueCounterparties: feats.uniqueCounterparties,
+      topCounterpartyShare: feats.topCounterpartyShare,
+      bucket: mixImpact > 0 ? "concentrated" : "diversified"
+    }
+  };
+
+  // Neighbor / cluster (placeholder until true neighbor scoring)
+  const neighborImpact = feats.uniqueCounterparties > 10 ? +3 : 0;
+  contribution += neighborImpact;
+  parts.neighbor = {
+    id: "neighbor",
+    label: "Neighbor & cluster risk",
+    impact: neighborImpact,
+    details: {
+      neighborCount: feats.uniqueCounterparties,
+      mixedCluster: neighborImpact > 0
+    }
+  };
+
+  // Lists
+  let listImpact = 0;
+  const listDetails = {};
+  if (ofacHit) {
+    listImpact += 70;
+    listDetails.ofac = true;
+  }
+  if (inTornado) {
+    listImpact += 25;
+    listDetails.tornado = true;
+  }
+  if (inScam) {
+    listImpact += 25;
+    listDetails.scamCluster = true;
+  }
+  contribution += listImpact;
+  parts.lists = {
+    id: "lists",
+    label: "External fraud & platform signals",
+    impact: listImpact,
+    details: listDetails
+  };
+
+  parts.concentration = {
+    id: "concentration",
+    label: "Flow concentration (fan-in/out)",
+    impact: 0,
+    details: {}
+  };
+  parts.dormant = {
+    id: "dormant",
+    label: "Dormancy & resurrection patterns",
+    impact: 0,
+    details: {
+      isDormant: feats.isDormant,
+      dormantDays: feats.dormantDays,
+      resurrectedRecently: feats.resurrectedRecently
+    }
+  };
+  parts.governance = {
+    id: "governance",
+    label: "Governance / override",
+    impact: 0,
+    details: {}
+  };
+
+  const rawScore = baseScore + contribution;
+  const score = clamp(rawScore, 0, 100);
+
+  const reasons = [];
+  if (parts.velocity.impact > 0) reasons.push("Transaction velocity & bursts");
+  if (parts.age.impact > 0)      reasons.push("Wallet age");
+  if (parts.neighbor.impact > 0) reasons.push("Neighbor & cluster risk");
+  if (parts.mix.impact > 0)      reasons.push("Counterparty mix & concentration");
+  if (ofacHit)                   reasons.push("OFAC / sanctions list match");
+  if (inTornado)                 reasons.push("Mixer / Tornado Cash proximity");
+  if (inScam)                    reasons.push("Known scam cluster exposure");
+  if (!reasons.length)           reasons.push("Baseline risk");
+
+  parts.baseScore = baseScore;
+  parts.rawContribution = contribution;
+  parts.confidence = 1;
+
+  return { score, reasons, parts };
+}
+
+/* ====================================================================== */
+/* ========================= UTILITIES ================================== */
+/* ====================================================================== */
 
 function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
+  return new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-    },
+      "access-control-allow-origin": "*"
+    }
   });
+}
+
+function parseSet(str) {
+  if (!str || typeof str !== "string") return new Set();
+  const out = new Set();
+  str
+    .split(/[\r\n,]+/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+    .forEach(v => out.add(v));
+  return out;
+}
+
+function clamp(x, min, max) {
+  return Math.max(min, Math.min(max, x));
+}
+
+function stubNeighbors(center, network) {
+  const centerId = center.toLowerCase();
+  const n = 10;
+  const nodes = [{ id: centerId, address: centerId, network }];
+  const links = [];
+  for (let i = 0; i < n; i++) {
+    const id = `0x${Math.random().toString(16).slice(2).padStart(40, "0").slice(0, 40)}`;
+    nodes.push({ id, address: id, network });
+    links.push({ a: centerId, b: id, weight: 1 });
+  }
+  return { nodes, links };
 }
