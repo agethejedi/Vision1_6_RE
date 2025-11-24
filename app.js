@@ -99,9 +99,8 @@ function normalizeResult(res = {}) {
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // Ensure OFAC + list flags are set on explain
+  // Ensure OFAC flag is set on explain
   coerceOfacFlag(explain, res);
-  coerceListFlags(explain, res);
 
   // Force explain.score to match the final server score so the meter & narrative agree
   if (serverScore != null) {
@@ -163,6 +162,8 @@ function normalizeResult(res = {}) {
 async function init() {
   document.title = 'RiskXLabs — Vision 1_5_RE';
 
+  console.log('[Vision] init() starting', window.VisionConfig);
+
   await post('INIT', {
     apiBase: (window.VisionConfig && window.VisionConfig.API_BASE) || "",
     cache: window.RiskCache,
@@ -206,6 +207,7 @@ function bindUI() {
     const seedRaw = document.getElementById('seedInput').value.trim();
     if (!seedRaw) return;
     const seed = normId(seedRaw);
+    console.log('[Vision] Load seed clicked', seed);
     pushNav(seed);
     centerOnSeedAndLoad(seed);
   });
@@ -331,7 +333,7 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
 
 const FACTOR_WEIGHTS = {
   'OFAC': 40,
-  'OFAC / sanctions list match': 40,
+  'OFAC/sanctions list match': 40,
   'sanctioned Counterparty': 40,
   'fan In High': 9,
   'shortest Path To Sanctioned': 6,
@@ -542,20 +544,25 @@ let lastRenderResult = null;
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
 
-  // Make sure we have the latest signals snapshot
-  const sig = expl.signals ||
-              lastRenderResult?.explain?.signals ||
-              lastRenderResult?.signals ||
-              {};
+  // Derive list/signal-based flags (Tornado & Scam clusters)
+  const listDetails = expl?.parts?.lists?.details || {};
+  const sig = expl?.signals || lastRenderResult?.explain?.signals || {};
 
-  const tornadoHit = !!(expl.tornadoHit || sig.tornadoHit || sig.tornado);
-  const scamClusterHit = !!(expl.scamClusterHit || sig.scamClusterHit || sig.scamCluster);
-  const mixerHit = !!(expl.mixerHit || sig.mixer || sig.mixerHit);
+  const mixerProx = !!(
+    expl.mixerLink ||
+    listDetails.tornado ||
+    sig.mixer
+  );
 
-  // Normalize back to expl so other code can see it
-  if (tornadoHit) expl.tornadoHit = true;
-  if (scamClusterHit) expl.scamClusterHit = true;
-  if (mixerHit) expl.mixerHit = true;
+  const scamCluster = !!(
+    expl.scamCluster ||
+    listDetails.scamCluster ||
+    sig.scamPlatform
+  );
+
+  // Normalise back onto expl so other code can use them
+  expl.mixerLink = mixerProx;
+  expl.scamCluster = scamCluster;
 
   const daysForNice = typeof lastRenderResult?.feats?.ageDays === 'number'
     ? lastRenderResult.feats.ageDays : null;
@@ -579,7 +586,13 @@ function narrativeFromExplain(expl, mode = 'analyst') {
     parts.push('in a high-volume counterparty cluster');
   }
 
-  if (expl.mixerLink || mixerHit) parts.push('with adjacency to mixer infrastructure');
+  if (mixerProx && scamCluster) {
+    parts.push('combining mixer flows with a sketchy address cluster');
+  } else if (mixerProx) {
+    parts.push('with adjacency to mixer infrastructure');
+  } else if (scamCluster) {
+    parts.push('linked to a sketchy / scam cluster');
+  }
 
   let text = 'This wallet is ' + (parts.length ? parts.join(', ') : 'under assessment') + '.';
   if (!expl.ofacHit) text += ' No direct OFAC link was found.';
@@ -595,22 +608,11 @@ function narrativeFromExplain(expl, mode = 'analyst') {
 
   const badges = [];
   const push = (label, level='warn') => badges.push({ label, level });
-
-  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) {
-    push('Dormant Cluster', 'risk');
-  }
-  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) {
-    push('Young Wallet', 'warn');
-  }
-  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) {
-    push('High Counterparty Volume', 'warn');
-  }
-
-  // NEW: list badges – Tornado, Scam cluster, Mixer
-  if (tornadoHit) push('Tornado cluster', 'risk');
-  if (scamClusterHit) push('Scam cluster', 'risk');
-  if (mixerHit) push('Mixer proximity', 'risk');
-
+  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant Cluster', 'risk');
+  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) push('Young Wallet', 'warn');
+  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
+  if (mixerProx) push('Mixer proximity', 'risk');
+  if (scamCluster) push('Sketchy cluster', 'risk');
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
   const factors = Array.isArray(expl.factorImpacts)
@@ -756,30 +758,6 @@ function hasReason(res, kw){
   const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
   return txt.includes(kw);
 }
-
-// Pull signals + list flags up to explain so UI can use them.
-function coerceListFlags(explain, res) {
-  const sig = (res.explain && res.explain.signals) ||
-              res.signals ||
-              explain.signals ||
-              {};
-
-  const tornadoHit = !!(explain.tornadoHit || sig.tornadoHit || sig.tornado);
-  const scamClusterHit = !!(explain.scamClusterHit || sig.scamClusterHit || sig.scamCluster);
-  const mixerHit = !!(explain.mixerHit || sig.mixer || sig.mixerHit);
-
-  if (tornadoHit) explain.tornadoHit = true;
-  if (scamClusterHit) explain.scamClusterHit = true;
-  if (mixerHit) explain.mixerHit = true;
-
-  if (!explain.signals) explain.signals = {};
-  Object.assign(explain.signals, sig, {
-    tornadoHit: tornadoHit || sig.tornadoHit,
-    scamClusterHit: scamClusterHit || sig.scamClusterHit,
-    mixer: mixerHit || sig.mixer
-  });
-}
-
 function coerceOfacFlag(explain, res){
   const hit = !!(
     res.sanctionHits || res.sanctioned || res.ofac ||
