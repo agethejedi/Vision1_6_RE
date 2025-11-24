@@ -18,14 +18,6 @@ const RXL_FLAGS = Object.freeze({
 
 const worker = new Worker('./workers/visionRisk.worker.js', { type: 'module' });
 
-// Surface any worker boot / runtime issues into the main console
-worker.onerror = (err) => {
-  console.error('[Vision] worker error', err.message || err);
-};
-worker.onmessageerror = (err) => {
-  console.error('[Vision] worker message error', err);
-};
-
 const pending = new Map();
 function post(type, payload) {
   return new Promise((resolve, reject) => {
@@ -41,7 +33,6 @@ worker.onmessage = (e) => {
 
   if (type === 'INIT_OK') {
     if (req) { req.resolve(true); pending.delete(id); }
-    console.log('[Vision] worker INIT_OK');
     return;
   }
 
@@ -77,7 +68,7 @@ worker.onmessage = (e) => {
   }
 
   if (type === 'ERROR') {
-    console.error('[Vision] worker ERROR', error);
+    console.error(error);
     if (req) { req.reject(new Error(error)); pending.delete(id); }
     updateBatchStatus('Batch: error');
     setNeighborStatus('Error loading neighbors');
@@ -108,8 +99,9 @@ function normalizeResult(res = {}) {
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // Ensure OFAC flag is set on explain
+  // Ensure OFAC and list flags are set on explain
   coerceOfacFlag(explain, res);
+  coerceListFlags(explain, res);
 
   // Force explain.score to match the final server score so the meter & narrative agree
   if (serverScore != null) {
@@ -168,11 +160,10 @@ function normalizeResult(res = {}) {
 
 /* ================= Init =========================================== */
 
-function init() {
-  document.title = 'RiskXLabs — Vision 1_6_RE';
-  console.log('[Vision] init() starting', window.VisionConfig);
+async function init() {
+  document.title = 'RiskXLabs — Vision 1_5_RE';
 
-  post('INIT', {
+  await post('INIT', {
     apiBase: (window.VisionConfig && window.VisionConfig.API_BASE) || "",
     cache: window.RiskCache,
     network: getNetwork(),
@@ -184,20 +175,11 @@ function init() {
       neighborStats: true,
       cacheNeighborsTTL: 600000 // 10 min
     }
-  })
-    .then(() => {
-      console.log('[Vision] worker INIT_OK (promise resolved)');
-    })
-    .catch((err) => {
-      console.error('[Vision] worker INIT failed', err);
-      updateBatchStatus('Worker init error');
-    })
-    .finally(() => {
-      // Even if INIT fails, we still wire the UI so clicks do *something*
-      bindUI();
-      applyFeatureTogglesFromUI();
-      seedDemo();
-    });
+  });
+
+  bindUI();
+  applyFeatureTogglesFromUI();
+  seedDemo();
 }
 init();
 
@@ -224,15 +206,12 @@ function bindUI() {
     const seedRaw = document.getElementById('seedInput').value.trim();
     if (!seedRaw) return;
     const seed = normId(seedRaw);
-    console.log('[Vision] Load seed clicked', seed);
     pushNav(seed);
     centerOnSeedAndLoad(seed);
   });
 
   document.getElementById('networkSelect')?.addEventListener('change', async () => {
-    await post('INIT', { network: getNetwork() }).catch(err => {
-      console.error('[Vision] network INIT failed', err);
-    });
+    await post('INIT', { network: getNetwork() });
     scoreVisible();
   });
 
@@ -241,7 +220,6 @@ function bindUI() {
     window.graph.on('selectNode', (n) => {
       if (!n) return;
       const id = normId(n.id);
-      console.log('[Vision] graph selectNode', id);
       pushNav(id);
       centerOnSeedAndLoad(id);
     });
@@ -257,7 +235,6 @@ function bindUI() {
     if (navIndex > 0) {
       navIndex--;
       const id = navHistory[navIndex];
-      console.log('[Vision] navBack →', id);
       centerOnSeedAndLoad(id, { pushHistory: false });
     }
   });
@@ -265,7 +242,6 @@ function bindUI() {
     if (navIndex < navHistory.length - 1) {
       navIndex++;
       const id = navHistory[navIndex];
-      console.log('[Vision] navForward →', id);
       centerOnSeedAndLoad(id, { pushHistory: false });
     }
   });
@@ -324,13 +300,9 @@ function pushNav(id){
   navIndex = navHistory.length - 1;
 }
 
-/* centerOnSeedAndLoad — single entry point when a wallet becomes "focus" */
-
 async function centerOnSeedAndLoad(seed, opts = {}) {
   const network = getNetwork();
   setSelected(seed);
-  console.log('[Vision] centerOnSeedAndLoad', { seed, network });
-
   // Replace graph with centered node while loading neighbors
   setGraphData({ nodes:[{ id: seed, address: seed, network }], links:[] });
   setNeighborStatusLoading();
@@ -339,19 +311,14 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
   post('SCORE_ONE', { item: { type:'address', id: seed, network } })
     .then(r => {
       const rr = normalizeResult(r);
-      console.log('[Vision] SCORE_ONE result', rr);
       updateScorePanel(rr);
       applyVisualCohesion(rr);
       renderNarrativePanelIfEnabled(rr);
     })
-    .catch((err)=>{
-      console.error('[Vision] SCORE_ONE failed', err);
-      updateBatchStatus('Score error');
-    });
+    .catch(()=>{});
 
   // Neighbors
-  refreshGraphFromLive(seed).catch((err)=>{
-    console.error('[Vision] neighbors failed', err);
+  refreshGraphFromLive(seed).catch(()=>{
     setNeighborStatus('Neighbors: unavailable');
   });
 
@@ -364,7 +331,7 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
 
 const FACTOR_WEIGHTS = {
   'OFAC': 40,
-  'OFAC/sanctions list match': 40,
+  'OFAC / sanctions list match': 40,
   'sanctioned Counterparty': 40,
   'fan In High': 9,
   'shortest Path To Sanctioned': 6,
@@ -412,16 +379,13 @@ function updateScorePanel(res) {
   const neighborLine = `Neighbors flagged: <b>${neighPct}</b>` +
     (typeof neighCount === 'number' ? ` (${neighCount} neighbors)` : '');
 
-  const metaEl = document.getElementById('entityMeta');
-  if (metaEl) {
-    metaEl.innerHTML = `
-      <div>Address: <b>${res.id}</b></div>
-      <div>Network: <b>${res.network}</b></div>
-      <div>Age: <b>${ageDisplay}</b></div>
-      <div>Mixer taint: <b>${mixerPct}</b></div>
-      <div>${neighborLine}</div>
-    `;
-  }
+  document.getElementById('entityMeta').innerHTML = `
+    <div>Address: <b>${res.id}</b></div>
+    <div>Network: <b>${res.network}</b></div>
+    <div>Age: <b>${ageDisplay}</b></div>
+    <div>Mixer taint: <b>${mixerPct}</b></div>
+    <div>${neighborLine}</div>
+  `;
 }
 
 /* ================= Unified visuals (halo + ring) ================= */
@@ -526,9 +490,7 @@ async function getNeighborsLive(centerId){
       limit: (window.VisionConfig?.GRAPH?.neighborLimit || 120)
     });
     if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
-  } catch (err) {
-    console.error('[Vision] getNeighborsLive failed', err);
-  }
+  } catch {}
   return { nodes: [], links: [] };
 }
 
@@ -618,9 +580,25 @@ function narrativeFromExplain(expl, mode = 'analyst') {
 
   const badges = [];
   const push = (label, level='warn') => badges.push({ label, level });
-  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant Cluster', 'risk');
-  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) push('Young Wallet', 'warn');
-  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
+
+  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) {
+    push('Dormant Cluster', 'risk');
+  }
+  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) {
+    push('Young Wallet', 'warn');
+  }
+  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) {
+    push('High Counterparty Volume', 'warn');
+  }
+
+  // NEW: list badges
+  if (expl.tornadoHit) {
+    push('Tornado cluster', 'risk');
+  }
+  if (expl.scamClusterHit) {
+    push('Scam cluster', 'risk');
+  }
+
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
   const factors = Array.isArray(expl.factorImpacts)
@@ -766,6 +744,22 @@ function hasReason(res, kw){
   const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
   return txt.includes(kw);
 }
+
+function coerceListFlags(explain, res) {
+  const sig = (res.explain && res.explain.signals) || res.signals || {};
+
+  if (sig.tornadoHit || sig.tornado || res.tornadoHit) {
+    explain.tornadoHit = true;
+  }
+  if (sig.scamClusterHit || sig.scamCluster || res.scamClusterHit) {
+    explain.scamClusterHit = true;
+  }
+
+  if (sig && typeof sig === 'object') {
+    explain.signals = { ...(explain.signals || {}), ...sig };
+  }
+}
+
 function coerceOfacFlag(explain, res){
   const hit = !!(
     res.sanctionHits || res.sanctioned || res.ofac ||
