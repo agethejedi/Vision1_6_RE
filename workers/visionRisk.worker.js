@@ -1,8 +1,8 @@
 // workers/visionRisk.worker.js
-// Vision v1.6.2 — front-end worker that calls the Cloudflare risk engine
+// Vision v1.6.3 — front-end worker that calls the Cloudflare risk engine
 // and handles neighbor fetching / batching for the graph.
 
-console.log('[visionWorker] booting v1.6.2');
+console.log('[visionWorker] booting v1.6.3');
 
 let CFG = {
   apiBase: "",
@@ -23,9 +23,6 @@ const neighborCache = new Map();  // key: `${network}:${address}` → {nodes,lin
 
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
-  // This log will only show in the worker console context
-  console.log('[visionWorker] onmessage', type, payload);
-
   try {
     if (type === 'INIT') {
       if (payload?.apiBase) CFG.apiBase = String(payload.apiBase).replace(/\/$/, "");
@@ -33,7 +30,7 @@ self.onmessage = async (e) => {
       if (payload?.concurrency) CFG.concurrency = payload.concurrency;
       if (payload?.flags) CFG.flags = { ...CFG.flags, ...payload.flags };
 
-      console.log('[visionWorker] INIT cfg=', CFG);
+      console.log('[visionWorker] INIT cfg', CFG);
       post({ id, type: 'INIT_OK' });
       return;
     }
@@ -47,8 +44,7 @@ self.onmessage = async (e) => {
 
     if (type === 'SCORE_BATCH') {
       const items = Array.isArray(payload?.items) ? payload.items : [];
-      console.log('[visionWorker] SCORE_BATCH', items.length);
-
+      console.log('[visionWorker] SCORE_BATCH', items);
       for (const it of items) {
         const r = await scoreOne(it);
         post({ type: 'RESULT_STREAM', data: r });
@@ -72,7 +68,7 @@ self.onmessage = async (e) => {
 
     throw new Error(`unknown type: ${type}`);
   } catch (err) {
-    console.error('[visionWorker] error inside handler', type, err);
+    console.error('[visionWorker] error', type, err);
     post({ id, type: 'ERROR', error: String(err?.message || err) });
   }
 };
@@ -97,14 +93,14 @@ async function scoreOne(item) {
   // cache hit
   const cached = scoreCache.get(cacheKey);
   if (cached) {
-    console.log('[visionWorker] SCORE_ONE cache hit', cacheKey);
+    console.debug('[visionWorker] SCORE_ONE cache hit', id);
     return cached;
   }
 
   if (!CFG.apiBase) throw new Error('scoreOne: apiBase not configured');
 
   const url = `${CFG.apiBase}/score?address=${encodeURIComponent(id)}&network=${encodeURIComponent(network)}`;
-  console.log('[visionWorker] SCORE_ONE →', url);
+  console.debug('[visionWorker] SCORE_ONE →', url);
 
   const r = await fetch(url, {
     headers: { 'accept': 'application/json' }
@@ -132,17 +128,17 @@ async function scoreOne(item) {
 async function getNeighbors(address, network, { hop = 1, limit = 120 } = {}) {
   const addr = String(address || '').toLowerCase();
   if (!addr) throw new Error('neighbors: empty address');
-
   const key = `${network}:${addr}`;
   const now = Date.now();
   const ttl = CFG.flags.cacheNeighborsTTL || 600000;
 
   const cached = neighborCache.get(key);
   if (cached && (now - cached.ts) < ttl) {
-    console.log('[visionWorker] neighbors cache hit', key);
+    console.debug('[visionWorker] neighbors cache hit', key);
     return cached.data;
   }
 
+  // If no backend configured at all → pure stub
   if (!CFG.apiBase) {
     const stub = stubNeighbors(addr, network);
     neighborCache.set(key, { ts: now, data: stub });
@@ -150,7 +146,7 @@ async function getNeighbors(address, network, { hop = 1, limit = 120 } = {}) {
   }
 
   const url = `${CFG.apiBase}/neighbors?address=${encodeURIComponent(addr)}&network=${encodeURIComponent(network)}&hop=${hop}&limit=${limit}`;
-  console.log('[visionWorker] NEIGHBORS →', url);
+  console.debug('[visionWorker] NEIGHBORS →', url);
 
   let data;
   try {
@@ -160,15 +156,29 @@ async function getNeighbors(address, network, { hop = 1, limit = 120 } = {}) {
       data = stubNeighbors(addr, network);
     } else {
       const raw = await resp.json().catch(() => ({}));
-      data = normalizeNeighbors(raw, addr, network, limit);
+      let normalized = normalizeNeighbors(raw, addr, network, limit);
+
+      // 🔧 IMPORTANT: if backend only returns the center node and no edges,
+      // treat it as "sparse" and fall back to synthetic neighbors so the UI
+      // has something useful to show.
+      const nodeCount = Array.isArray(normalized.nodes) ? normalized.nodes.length : 0;
+      const linkCount = Array.isArray(normalized.links) ? normalized.links.length : 0;
+
+      if (nodeCount <= 1 && linkCount === 0) {
+        console.warn('[visionWorker] neighbors: backend sparse (only center); using stub');
+        const stub = stubNeighbors(addr, network);
+        normalized = { ...stub, sparseNeighborhood: true };
+      }
+
+      data = normalized;
     }
   } catch (e) {
     console.warn('[visionWorker] neighbors fetch failed, using stub', e);
-    data = stubNeighbors(addr, network);
+    data = { ...stubNeighbors(addr, network), sparseNeighborhood: true };
   }
 
   neighborCache.set(key, { ts: now, data });
-  console.log('[visionWorker] neighbors(final)', {
+  console.debug('[visionWorker] neighbors(final)', {
     addr,
     totalNeighbors: (data.nodes?.length || 1) - 1,
     shown: (data.nodes?.length || 1) - 1,
@@ -212,6 +222,7 @@ function normalizeNeighbors(raw, centerId, network, limit) {
   }
 
   if (!nodes.length && !links.length) {
+    // this case is still handled by stub in caller, but keep a fallback here
     return stubNeighbors(center, network);
   }
 
@@ -228,7 +239,7 @@ function normalizeNeighbors(raw, centerId, network, limit) {
   }
   for (const n of finalNodes) {
     if (n.id !== center && !existing.has(n.id)) {
-      links.push({ a: center.id, b: n.id, weight: 1 });
+      links.push({ a: center, b: n.id, weight: 1 });
     }
   }
 
