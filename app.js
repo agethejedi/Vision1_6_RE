@@ -99,7 +99,7 @@ function normalizeResult(res = {}) {
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // Ensure OFAC and list flags are set on explain
+  // Ensure OFAC + list flags are set on explain
   coerceOfacFlag(explain, res);
   coerceListFlags(explain, res);
 
@@ -542,6 +542,21 @@ let lastRenderResult = null;
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
 
+  // Make sure we have the latest signals snapshot
+  const sig = expl.signals ||
+              lastRenderResult?.explain?.signals ||
+              lastRenderResult?.signals ||
+              {};
+
+  const tornadoHit = !!(expl.tornadoHit || sig.tornadoHit || sig.tornado);
+  const scamClusterHit = !!(expl.scamClusterHit || sig.scamClusterHit || sig.scamCluster);
+  const mixerHit = !!(expl.mixerHit || sig.mixer || sig.mixerHit);
+
+  // Normalize back to expl so other code can see it
+  if (tornadoHit) expl.tornadoHit = true;
+  if (scamClusterHit) expl.scamClusterHit = true;
+  if (mixerHit) expl.mixerHit = true;
+
   const daysForNice = typeof lastRenderResult?.feats?.ageDays === 'number'
     ? lastRenderResult.feats.ageDays : null;
   const niceAge = daysForNice != null ? fmtAgeDays(daysForNice) : null;
@@ -564,7 +579,7 @@ function narrativeFromExplain(expl, mode = 'analyst') {
     parts.push('in a high-volume counterparty cluster');
   }
 
-  if (expl.mixerLink) parts.push('with adjacency to mixer infrastructure');
+  if (expl.mixerLink || mixerHit) parts.push('with adjacency to mixer infrastructure');
 
   let text = 'This wallet is ' + (parts.length ? parts.join(', ') : 'under assessment') + '.';
   if (!expl.ofacHit) text += ' No direct OFAC link was found.';
@@ -591,13 +606,10 @@ function narrativeFromExplain(expl, mode = 'analyst') {
     push('High Counterparty Volume', 'warn');
   }
 
-  // NEW: list badges
-  if (expl.tornadoHit) {
-    push('Tornado cluster', 'risk');
-  }
-  if (expl.scamClusterHit) {
-    push('Scam cluster', 'risk');
-  }
+  // NEW: list badges – Tornado, Scam cluster, Mixer
+  if (tornadoHit) push('Tornado cluster', 'risk');
+  if (scamClusterHit) push('Scam cluster', 'risk');
+  if (mixerHit) push('Mixer proximity', 'risk');
 
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
@@ -745,19 +757,27 @@ function hasReason(res, kw){
   return txt.includes(kw);
 }
 
+// Pull signals + list flags up to explain so UI can use them.
 function coerceListFlags(explain, res) {
-  const sig = (res.explain && res.explain.signals) || res.signals || {};
+  const sig = (res.explain && res.explain.signals) ||
+              res.signals ||
+              explain.signals ||
+              {};
 
-  if (sig.tornadoHit || sig.tornado || res.tornadoHit) {
-    explain.tornadoHit = true;
-  }
-  if (sig.scamClusterHit || sig.scamCluster || res.scamClusterHit) {
-    explain.scamClusterHit = true;
-  }
+  const tornadoHit = !!(explain.tornadoHit || sig.tornadoHit || sig.tornado);
+  const scamClusterHit = !!(explain.scamClusterHit || sig.scamClusterHit || sig.scamCluster);
+  const mixerHit = !!(explain.mixerHit || sig.mixer || sig.mixerHit);
 
-  if (sig && typeof sig === 'object') {
-    explain.signals = { ...(explain.signals || {}), ...sig };
-  }
+  if (tornadoHit) explain.tornadoHit = true;
+  if (scamClusterHit) explain.scamClusterHit = true;
+  if (mixerHit) explain.mixerHit = true;
+
+  if (!explain.signals) explain.signals = {};
+  Object.assign(explain.signals, sig, {
+    tornadoHit: tornadoHit || sig.tornadoHit,
+    scamClusterHit: scamClusterHit || sig.scamClusterHit,
+    mixer: mixerHit || sig.mixer
+  });
 }
 
 function coerceOfacFlag(explain, res){
