@@ -1,539 +1,466 @@
 // workers/server.worker.js
-// RiskXLabs Vision API v1.6.4
-// - /score      → address risk score + features
-// - /neighbors  → simple neighbor graph for Vision
-// Uses: Etherscan + Alchemy hybrid, OFAC / Scam / Tornado lists from KV-style secrets.
+// RiskXLabs Vision – Cloudflare Worker risk engine v1.6.4
+//
+// Endpoints:
+//   GET /score?address=0x...&network=eth
+//   GET /neighbors?address=0x...&network=eth&hop=1&limit=120
+//   GET /tx-debug?address=0x...  (diagnostics only)
+//
+// Uses:
+//   ETHERSCAN_API_KEY (Secret)
+//   ALCHEMY_API_KEY   (Secret)
+//   OFAC_SET          (Plaintext – newline/CSV of hex addresses)
+//   SCAM_CLUSTERS     (Plaintext – newline/CSV of hex addresses)
+//   TORNADO_SET       (Plaintext – newline/CSV of hex addresses)
+//   OFACLIST          (optional legacy list – ignored by this version)
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+const VERSION = "RXL-V1.6.4";
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body, null, 2), {
+/* ========= Utilities ========= */
+
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: {
-      'content-type': 'application/json; charset=utf-8',
-      ...CORS_HEADERS,
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "Content-Type",
+      "access-control-allow-methods": "GET,OPTIONS",
     },
   });
-}
 
-export default {
-  async fetch(request, env, ctx) {
-    if (request.method === 'OPTIONS') {
-      return new Response('ok', { status: 204, headers: CORS_HEADERS });
-    }
-
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, '') || '/';
-
-    try {
-      if (path === '/score') {
-        return await handleScore(url, env);
-      }
-      if (path === '/neighbors') {
-        return await handleNeighbors(url, env);
-      }
-      if (path === '/tx-debug') {
-        return await handleTxDebug(url, env);
-      }
-      if (path === '/neighbors-debug') {
-        return await handleNeighborsDebug(url, env);
-      }
-
-      return json({ ok: true, service: 'riskxlabs-vision-api', version: '1.6.4' });
-    } catch (err) {
-      console.error('[VisionAPI] unhandled error', err);
-      return json({ ok: false, error: String(err?.message || err) }, 500);
-    }
-  }
-};
-
-/* ========================= CORE HELPERS ========================== */
-
-function normHex(addr) {
-  if (!addr) return null;
-  const s = String(addr).trim().toLowerCase();
-  return s && s.startsWith('0x') ? s : null;
+function badRequest(msg) {
+  return json({ ok: false, error: msg }, 400);
 }
 
 function parseHexSet(raw) {
-  const out = new Set();
-  if (!raw) return out;
-
-  const txt = String(raw).trim();
-
-  // JSON array
-  if (txt.startsWith('[')) {
-    try {
-      const arr = JSON.parse(txt);
-      for (const v of arr) {
-        const a = normHex(v);
-        if (a) out.add(a);
-      }
-      return out;
-    } catch (e) {
-      console.warn('[VisionAPI] parseHexSet JSON failed, falling back to split');
-    }
-  }
-
-  // Delimited text
-  txt
-    .split(/[\s,;\n\r]+/)
-    .map(normHex)
-    .filter(Boolean)
-    .forEach((a) => out.add(a));
-
-  return out;
+  if (!raw) return new Set();
+  return new Set(
+    String(raw)
+      .split(/[\r\n,]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.startsWith("0x") && s.length >= 6)
+  );
 }
 
-/* ========================= TX FETCH (HYBRID) ===================== */
+function clamp(x, lo = 0, hi = 100) {
+  return Math.max(lo, Math.min(hi, x));
+}
 
-/**
- * Normalized tx object:
- * { hash, from, to, value, time }  // time in seconds (number)
- */
-async function fetchTxHistoryHybrid(address, network, env) {
-  const center = normHex(address);
-  if (!center) throw new Error('Invalid address');
+/* ========= Tx providers ========= */
 
-  if (network !== 'eth') {
-    // For now we only support Ethereum mainnet neighbors.
-    return { provider: 'synthetic', txs: [] };
+async function fetchEtherscanTxs(address, env) {
+  const key = env.ETHERSCAN_API_KEY;
+  if (!key) throw new Error("missing ETHERSCAN_API_KEY");
+  const url =
+    "https://api.etherscan.io/api?module=account&action=txlist" +
+    `&address=${encodeURIComponent(address)}` +
+    "&startblock=0&endblock=99999999&sort=asc" +
+    `&apikey=${encodeURIComponent(key)}`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`etherscan bad status ${res.status}`);
+  const body = await res.json();
+  if (String(body.status) !== "1" || !Array.isArray(body.result)) {
+    throw new Error("etherscan no tx");
   }
+  return body.result.map((tx) => ({
+    timeStamp: Number(tx.timeStamp) * 1000,
+    hash: tx.hash,
+    from: tx.from?.toLowerCase(),
+    to: tx.to?.toLowerCase() || null,
+    value: tx.value || "0",
+  }));
+}
 
-  let txs = [];
-  let provider = null;
+// Minimal Alchemy fallback – uses getAssetTransfers in both directions
+async function fetchAlchemyTxs(address, env) {
+  const key = env.ALCHEMY_API_KEY;
+  if (!key) throw new Error("missing ALCHEMY_API_KEY");
+  const base = `https://eth-mainnet.g.alchemy.com/v2/${key}`;
+  const addr = address.toLowerCase();
 
-  // ---- 1) Etherscan first ---------------------------------------
-  if (env.ETHERSCAN_API_KEY) {
-    try {
-      const key = env.ETHERSCAN_API_KEY;
-
-      async function fetchEtherscan(action) {
-        const u = `https://api.etherscan.io/api?module=account&action=${action}` +
-                  `&address=${center}&startblock=0&endblock=99999999&sort=asc&apikey=${key}`;
-        const r = await fetch(u);
-        if (!r.ok) throw new Error(`etherscan ${action} HTTP ${r.status}`);
-        const j = await r.json();
-        if (j.status !== '1' || !Array.isArray(j.result)) return [];
-        return j.result;
-      }
-
-      const [normal, internal, token] = await Promise.all([
-        fetchEtherscan('txlist'),
-        fetchEtherscan('txlistinternal'),
-        fetchEtherscan('tokentx'),
-      ]);
-
-      const all = [];
-
-      function pushFromEtherscan(list, kind) {
-        for (const t of list || []) {
-          const from = normHex(t.from);
-          const to = normHex(t.to || t.contractAddress);
-          const ts = Number(t.timeStamp || t.time || 0) || 0;
-          all.push({
-            hash: t.hash || `${kind}:${t.transactionHash || '0x'}`,
-            from: from || center,
-            to: to || center,
-            value: String(t.value ?? '0'),
-            time: ts,
-          });
-        }
-      }
-
-      pushFromEtherscan(normal, 'normal');
-      pushFromEtherscan(internal, 'internal');
-      pushFromEtherscan(token, 'token');
-
-      if (all.length) {
-        all.sort((a, b) => a.time - b.time);
-        txs = all;
-        provider = 'etherscan';
-      }
-    } catch (e) {
-      console.warn('[VisionAPI] Etherscan fetch failed', e);
-    }
-  }
-
-  // ---- 2) Alchemy fallback ---------------------------------------
-  if (!txs.length && env.ALCHEMY_API_KEY && network === 'eth') {
-    try {
-      const key = env.ALCHEMY_API_KEY;
-      const rpc = `https://eth-mainnet.g.alchemy.com/v2/${key}`;
-
-      async function alchemyTransfers(body) {
-        const r = await fetch(rpc, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!r.ok) throw new Error(`alchemy HTTP ${r.status}`);
-        const j = await r.json();
-        return j.result?.transfers || [];
-      }
-
-      const baseBody = {
-        id: 1,
-        jsonrpc: '2.0',
-        method: 'alchemy_getAssetTransfers',
-        params: [{
-          category: ['external', 'erc20', 'erc721', 'erc1155'],
-          maxCount: '0x3e8', // 1000
+  async function oneDirection(direction) {
+    const body = {
+      id: 1,
+      jsonrpc: "2.0",
+      method: "alchemy_getAssetTransfers",
+      params: [
+        {
+          category: ["external"],
+          [direction === "from" ? "fromAddress" : "toAddress"]: addr,
+          maxCount: "0x3e8", // 1000
           withMetadata: true,
-        }],
-      };
-
-      const [outbound, inbound] = await Promise.all([
-        alchemyTransfers({
-          ...baseBody,
-          params: [{ ...baseBody.params[0], fromAddress: center }],
-        }),
-        alchemyTransfers({
-          ...baseBody,
-          params: [{ ...baseBody.params[0], toAddress: center }],
-        }),
-      ]);
-
-      const seen = new Set();
-      const all = [];
-
-      function pushAl(list, dir) {
-        for (const t of list || []) {
-          const hash = t.hash || t.transactionHash || `${dir}:${t.uniqueId}`;
-          if (seen.has(hash)) continue;
-          seen.add(hash);
-
-          const from = normHex(t.from) || center;
-          const to = normHex(t.to) || center;
-          const ts = Number(t.metadata?.blockTimestamp ? Date.parse(t.metadata.blockTimestamp) / 1000 : 0) || 0;
-          all.push({
-            hash,
-            from,
-            to,
-            value: String(t.value ?? '0'),
-            time: ts,
-          });
-        }
-      }
-
-      pushAl(outbound, 'out');
-      pushAl(inbound, 'in');
-
-      if (all.length) {
-        all.sort((a, b) => a.time - b.time);
-        txs = all;
-        provider = 'alchemy';
-      }
-    } catch (e) {
-      console.warn('[VisionAPI] Alchemy fetch failed', e);
-    }
+        },
+      ],
+    };
+    const res = await fetch(base, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`alchemy bad status ${res.status}`);
+    const json = await res.json();
+    const txs = json?.result?.transfers || [];
+    return txs.map((t) => ({
+      timeStamp: Date.parse(t.metadata?.blockTimestamp || new Date().toISOString()),
+      hash: t.hash,
+      from: t.from?.toLowerCase(),
+      to: t.to?.toLowerCase() || null,
+      value: t.value || "0",
+    }));
   }
 
-  // ---- 3) Synthetic fallback -------------------------------------
-  if (!txs.length) {
-    const now = Math.floor(Date.now() / 1000);
-    txs = [{
-      hash: '0xsynthetic',
-      from: center,
-      to: center,
-      value: '0',
-      time: now,
-    }];
-    provider = 'synthetic';
-  }
+  const [out, incoming] = await Promise.allSettled([
+    oneDirection("from"),
+    oneDirection("to"),
+  ]);
 
-  return { provider, txs };
+  const merged = [];
+  if (out.status === "fulfilled") merged.push(...out.value);
+  if (incoming.status === "fulfilled") merged.push(...incoming.value);
+
+  if (!merged.length) throw new Error("alchemy no tx");
+  // sort oldest → newest
+  merged.sort((a, b) => a.timeStamp - b.timeStamp);
+  return merged;
 }
 
-/* ========================= NEIGHBOR BUILD ======================== */
+// Try etherscan then alchemy; on total failure, synthetic stub
+async function fetchTxHistory(address, env) {
+  const providers = [
+    { name: "etherscan", fn: () => fetchEtherscanTxs(address, env) },
+    { name: "alchemy", fn: () => fetchAlchemyTxs(address, env) },
+  ];
 
-function buildNeighborStats(address, txs, ctxLists) {
-  const center = normHex(address);
-  const counts = new Map();
-
-  for (const t of txs) {
-    const from = normHex(t.from);
-    const to = normHex(t.to);
-    if (!from || !to) continue;
-
-    if (from === center && to !== center) {
-      counts.set(to, (counts.get(to) || 0) + 1);
-    } else if (to === center && from !== center) {
-      counts.set(from, (counts.get(from) || 0) + 1);
+  const errors = [];
+  for (const p of providers) {
+    try {
+      const txs = await p.fn();
+      return { ok: true, provider: p.name, txs };
+    } catch (e) {
+      errors.push({ provider: p.name, error: String(e.message || e) });
     }
   }
 
-  const neighbors = [...counts.keys()];
-  const neighborCount = neighbors.length;
+  // Fallback synthetic history (one self-tx today) so engine always returns something
+  const nowSec = Math.floor(Date.now() / 1000);
+  return {
+    ok: false,
+    provider: null,
+    txs: [
+      {
+        timeStamp: nowSec * 1000,
+        hash: "0xsynthetic",
+        from: address,
+        to: address,
+        value: "0",
+      },
+    ],
+    errors,
+  };
+}
 
-  let sanctionedNeighbors = 0;
-  let mixerNeighbors = 0;
-  let scamNeighbors = 0;
+/* ========= Feature extraction ========= */
 
-  for (const n of neighbors) {
-    if (ctxLists.ofacSet.has(n)) sanctionedNeighbors++;
-    if (ctxLists.tornadoSet.has(n)) mixerNeighbors++;
-    if (ctxLists.scamSet.has(n)) scamNeighbors++;
+function buildFeatures(address, txs, nowMs) {
+  const addr = address.toLowerCase();
+  const txList = Array.isArray(txs) ? txs : [];
+  if (!txList.length) {
+    return {
+      ageDays: 0,
+      firstSeenMs: null,
+      txCount: 0,
+      activeDays: 0,
+      txPerDay: 0,
+      burstScore: 0,
+      uniqueCounterparties: 0,
+      topCounterpartyShare: 0,
+      isDormant: false,
+      dormantDays: 0,
+      resurrectedRecently: false,
+      neighborCount: 0,
+      sanctionedNeighborRatio: 0,
+      highRiskNeighborRatio: 0,
+      dormantNeighborRatio: 0,
+      mixerProximity: 0,
+      custodianExposure: 0,
+      scamPlatformExposure: 0,
+      local: {
+        riskyNeighborRatio: 0,
+        neighborAvgTx: 0,
+        neighborAvgAgeDays: 0,
+        neighborCount: 0,
+      },
+    };
   }
 
-  const highRiskNeighbors = sanctionedNeighbors + mixerNeighbors + scamNeighbors;
+  // Sort oldest → newest by timestamp
+  txList.sort((a, b) => (a.timeStamp || 0) - (b.timeStamp || 0));
 
-  const featsLocal = {
-    neighborCount,
-    riskyNeighborRatio: neighborCount ? highRiskNeighbors / neighborCount : 0,
-    neighborAvgTx: neighborCount
-      ? [...counts.values()].reduce((a, b) => a + b, 0) / neighborCount
+  const firstTs = txList[0].timeStamp || nowMs;
+  const lastTs = txList[txList.length - 1].timeStamp || nowMs;
+  const ageDays = (nowMs - firstTs) / (1000 * 60 * 60 * 24);
+  const spanDays = Math.max(1, (lastTs - firstTs) / (1000 * 60 * 60 * 24));
+  const txCount = txList.length;
+  const txPerDay = txCount / spanDays;
+
+  // Burst metric – crude: max tx/day / avg tx/day
+  const perDay = new Map();
+  for (const tx of txList) {
+    const d = Math.floor((tx.timeStamp || nowMs) / (1000 * 60 * 60 * 24));
+    perDay.set(d, (perDay.get(d) || 0) + 1);
+  }
+  const maxPerDay = Math.max(...perDay.values());
+  const burstScore = txPerDay > 0 ? clamp(maxPerDay / txPerDay, 0, 10) / 10 : 0;
+
+  // Counterparty stats
+  const cpCounts = new Map(); // other address → count
+  for (const tx of txList) {
+    const from = tx.from?.toLowerCase();
+    const to = tx.to?.toLowerCase();
+    let other = null;
+    if (from === addr && to && to !== addr) other = to;
+    else if (to === addr && from && from !== addr) other = from;
+    if (other) cpCounts.set(other, (cpCounts.get(other) || 0) + 1);
+  }
+
+  const uniqueCounterparties = cpCounts.size;
+  const totalCpTx = [...cpCounts.values()].reduce((a, b) => a + b, 0) || 1;
+  const topCounterpartyShare = totalCpTx
+    ? Math.max(...cpCounts.values(), 0) / totalCpTx
+    : 0;
+
+  // Dormancy – if no tx in last 90 days but age > 180d
+  const daysSinceLast =
+    (nowMs - (lastTs || nowMs)) / (1000 * 60 * 60 * 24);
+  const isDormant = ageDays > 180 && daysSinceLast > 90;
+
+  // Neighbor details – only basic for now
+  const neighborCount = uniqueCounterparties;
+  const local = {
+    riskyNeighborRatio: 0,
+    neighborAvgTx: uniqueCounterparties
+      ? totalCpTx / uniqueCounterparties
       : 0,
-    neighborAvgAgeDays: null, // could compute later with per-neighbor lookups
+    neighborAvgAgeDays: 0,
+    neighborCount,
   };
 
   return {
-    neighbors,
-    counts,
-    sanctionedNeighbors,
-    mixerNeighbors,
-    scamNeighbors,
-    featsLocal,
-  };
-}
-
-/* ========================= RISK MODEL (INLINE) =================== */
-
-function runRiskModel(address, network, txs, neighborCtx, lists) {
-  const addr = normHex(address);
-
-  const nowSec = Date.now() / 1000;
-  const times = txs.map(t => t.time || 0).filter(Boolean);
-  const firstTs = times.length ? Math.min(...times) : nowSec;
-  const lastTs = times.length ? Math.max(...times) : nowSec;
-
-  const ageDays = Math.max(0, (nowSec - firstTs) / 86400);
-  const activeDays = Math.max(1, (lastTs - firstTs) / 86400);
-  const txCount = txs.length;
-  const txPerDay = txCount / activeDays;
-
-  // Flow concentration: share of most-common counterparty
-  const counter = new Map();
-  for (const t of txs) {
-    const from = normHex(t.from);
-    const to = normHex(t.to);
-    if (from === addr && to && to !== addr) {
-      counter.set(to, (counter.get(to) || 0) + 1);
-    } else if (to === addr && from && from !== addr) {
-      counter.set(from, (counter.get(from) || 0) + 1);
-    }
-  }
-  const uniqueCounterparties = counter.size;
-  const maxFlows = uniqueCounterparties
-    ? Math.max(...counter.values())
-    : 0;
-  const topCounterpartyShare = uniqueCounterparties
-    ? maxFlows / txCount
-    : 0;
-
-  // Simple burst metric: max daily tx vs avg
-  const perDay = new Map();
-  for (const t of txs) {
-    const d = Math.floor((t.time || nowSec) / 86400);
-    perDay.set(d, (perDay.get(d) || 0) + 1);
-  }
-  const maxDay = perDay.size ? Math.max(...perDay.values()) : 0;
-  const avgDay = perDay.size ? txCount / perDay.size : 0;
-  const burstScore = avgDay ? Math.min(1, maxDay / (avgDay * 3)) : 0;
-
-  const feats = {
     ageDays,
-    firstSeenMs: firstTs * 1000,
+    firstSeenMs: firstTs,
     txCount,
-    activeDays,
+    activeDays: Math.round(spanDays),
     txPerDay,
     burstScore,
     uniqueCounterparties,
     topCounterpartyShare,
-    isDormant: false,
-    dormantDays: 0,
-    resurrectedRecently: false,
-    neighborCount: neighborCtx.featsLocal.neighborCount,
-    sanctionedNeighborRatio: neighborCtx.featsLocal.neighborCount
-      ? neighborCtx.sanctionedNeighbors / neighborCtx.featsLocal.neighborCount
-      : 0,
-    highRiskNeighborRatio: neighborCtx.featsLocal.riskyNeighborRatio,
+    isDormant,
+    dormantDays: daysSinceLast,
+    resurrectedRecently: !isDormant && daysSinceLast < 14 && ageDays > 60,
+    neighborCount,
+    sanctionedNeighborRatio: 0,
+    highRiskNeighborRatio: 0,
     dormantNeighborRatio: 0,
-    mixerProximity: neighborCtx.mixerNeighbors > 0 ? 0.8 : 0,
+    mixerProximity: 0,
     custodianExposure: 0,
-    scamPlatformExposure: neighborCtx.scamNeighbors > 0 ? 0.7 : 0,
-    local: neighborCtx.featsLocal,
+    scamPlatformExposure: 0,
+    local,
   };
+}
 
-  /* --------- scoring contributions ------------------------ */
+/* ========= Risk model (same logic as lib/risk-model.js) ========= */
 
-  let baseScore = 15;
-  let rawContribution = 0;
+function scoreWithLists(address, network, feats, lists) {
+  const addr = address.toLowerCase();
+  const {
+    ofacSet,
+    scamSet,
+    tornadoSet,
+  } = lists;
+
   const parts = {};
+  const notes = [];
+  const baseScore = 15;
 
-  // Wallet age
+  /* ---- Age ---- */
+  const d = feats.ageDays;
   let ageImpact = 0;
-  let ageBucket = '> 2 years';
-  if (ageDays < 7) {
+  let ageBucket = "unknown";
+  if (d <= 7) {
     ageImpact = 25;
-    ageBucket = '< 1 week';
-  } else if (ageDays < 180) {
+    ageBucket = "< 1 week";
+  } else if (d <= 180) {
     ageImpact = 10;
-    ageBucket = '1w–6m';
-  } else if (ageDays < 730) {
+    ageBucket = "1w–6m";
+  } else if (d <= 730) {
     ageImpact = 2;
-    ageBucket = '6m–2y';
-  } else {
+    ageBucket = "6m–2y";
+  } else if (d > 730) {
     ageImpact = -10;
-    ageBucket = '> 2 years';
+    ageBucket = "> 2y";
   }
-  rawContribution += ageImpact;
   parts.age = {
-    id: 'age',
-    label: 'Wallet age',
+    id: "age",
+    label: "Wallet age",
     impact: ageImpact,
-    details: { ageDays, bucket: ageBucket },
+    details: { ageDays: d, bucket: ageBucket },
   };
 
-  // Velocity
+  /* ---- Velocity ---- */
+  const { txPerDay, burstScore } = feats;
   let velImpact = 0;
-  let velBucket = 'normal';
+  let velBucket = "normal";
   if (txPerDay > 50 || burstScore > 0.8) {
     velImpact = 22;
-    velBucket = 'extreme';
+    velBucket = "extreme";
   } else if (txPerDay > 10 || burstScore > 0.6) {
     velImpact = 14;
-    velBucket = 'elevated';
-  } else if (txPerDay > 1 || burstScore > 0.3) {
-    velImpact = 6;
-    velBucket = 'active';
+    velBucket = "high";
+  } else if (txPerDay >= 1 || burstScore > 0.4) {
+    velImpact = 4;
+    velBucket = "mild";
   }
-  rawContribution += velImpact;
   parts.velocity = {
-    id: 'velocity',
-    label: 'Transaction velocity & bursts',
+    id: "velocity",
+    label: "Transaction velocity & bursts",
     impact: velImpact,
     details: { txPerDay, burstScore, bucket: velBucket },
   };
 
-  // Mix / concentration
+  /* ---- Mix / concentration ---- */
+  const { uniqueCounterparties, topCounterpartyShare } = feats;
   let mixImpact = 0;
-  let mixBucket = 'diversified';
-  if (uniqueCounterparties <= 2 && topCounterpartyShare >= 0.8 && txCount >= 10) {
+  let mixBucket = "balanced";
+  if (uniqueCounterparties <= 2 && topCounterpartyShare > 0.8) {
     mixImpact = 14;
-    mixBucket = 'concentrated';
-  } else if (uniqueCounterparties <= 5 && topCounterpartyShare >= 0.6) {
-    mixImpact = 6;
-    mixBucket = 'moderate concentration';
+    mixBucket = "concentrated";
+  } else if (uniqueCounterparties >= 8 && topCounterpartyShare < 0.3) {
+    mixImpact = -2;
+    mixBucket = "diversified";
   }
-  rawContribution += mixImpact;
   parts.mix = {
-    id: 'mix',
-    label: 'Counterparty mix & concentration',
+    id: "mix",
+    label: "Counterparty mix & concentration",
     impact: mixImpact,
-    details: { uniqueCounterparties, topCounterpartyShare, bucket: mixBucket },
+    details: {
+      uniqueCounterparties,
+      topCounterpartyShare,
+      bucket: mixBucket,
+    },
   };
 
-  // Neighbor risk
+  /* ---- Neighbor risk (placeholder – no sanctions on neighbors yet) ---- */
   let neighborImpact = 0;
-  const { featsLocal, sanctionedNeighbors, mixerNeighbors, scamNeighbors } = neighborCtx;
-  const mixedCluster =
-    sanctionedNeighbors + mixerNeighbors + scamNeighbors > 0 &&
-    featsLocal.neighborCount > 0;
+  const neighborCount = feats.neighborCount || 0;
+  if (neighborCount >= 30) neighborImpact = 6;
+  else if (neighborCount >= 10) neighborImpact = 3;
 
-  if (featsLocal.neighborCount > 0) {
-    if (featsLocal.riskyNeighborRatio >= 0.5) {
-      neighborImpact = 18;
-    } else if (featsLocal.riskyNeighborRatio >= 0.25) {
-      neighborImpact = 10;
-    } else if (featsLocal.neighborCount >= 10) {
-      neighborImpact = 4;
-    }
-  }
-  rawContribution += neighborImpact;
   parts.neighbor = {
-    id: 'neighbor',
-    label: 'Neighbor & cluster risk',
+    id: "neighbor",
+    label: "Neighbor & cluster risk",
     impact: neighborImpact,
     details: {
-      neighborCount: featsLocal.neighborCount,
+      neighborCount,
       sanctionedNeighborRatio: feats.sanctionedNeighborRatio,
       highRiskNeighborRatio: feats.highRiskNeighborRatio,
-      mixedCluster,
+      mixedCluster: false,
     },
   };
 
-  // Dormancy placeholder
+  /* ---- Dormancy patterns ---- */
+  let dormantImpact = 0;
+  if (feats.isDormant && feats.ageDays > 365) {
+    dormantImpact = 4;
+  }
   parts.dormant = {
-    id: 'dormant',
-    label: 'Dormancy & resurrection patterns',
-    impact: 0,
+    id: "dormant",
+    label: "Dormancy & resurrection patterns",
+    impact: dormantImpact,
     details: {
-      isDormant: false,
+      isDormant: feats.isDormant,
       dormantDays: feats.dormantDays,
-      resurrectedRecently: false,
+      resurrectedRecently: feats.resurrectedRecently,
     },
   };
 
-  // External lists (OFAC, Tornado, Scam cluster)
+  /* ---- Lists: OFAC, scam clusters, mixer (Tornado) ---- */
   let listsImpact = 0;
   const listDetails = {};
-  let sanctionHits = 0;
-  let block = false;
 
-  if (lists.ofacSet.has(addr)) {
+  const ofacHit = ofacSet.has(addr);
+  if (ofacHit) {
     listsImpact += 70;
     listDetails.ofac = true;
-    sanctionHits = 1;
-    block = true;
+    notes.push("OFAC / sanctions list match");
   }
-  if (lists.tornadoSet.has(addr)) {
-    listsImpact += 25;
-    listDetails.tornado = true;
-  }
-  if (lists.scamSet.has(addr)) {
-    listsImpact += 35;
+
+  if (scamSet.has(addr)) {
+    // Stronger hit – we want standalone scam cluster ~75–85
+    listsImpact += 55;
     listDetails.scamCluster = true;
   }
 
-  // Tornado + Scam combo → strong boost (~75–90 total)
-  if (listDetails.tornado && listDetails.scamCluster) {
-    listsImpact += 15; // pushes many combos into 80–90 range
+  if (tornadoSet.has(addr)) {
+    // Mixer proximity – moderate by itself
+    listsImpact += 30;
+    listDetails.tornado = true;
   }
 
-  rawContribution += listsImpact;
+  // Combo bonus: Tornado + Sketchy cluster
+  if (listDetails.tornado && listDetails.scamCluster) {
+    listsImpact += 35; // pushes into 80–95 band
+  }
+
   parts.lists = {
-    id: 'lists',
-    label: 'External fraud & platform signals',
+    id: "lists",
+    label: "External fraud & platform signals",
     impact: listsImpact,
     details: listDetails,
   };
 
-  // Governance placeholder
-  parts.governance = {
-    id: 'governance',
-    label: 'Governance / override',
+  /* ---- Concentration placeholder ---- */
+  parts.concentration = {
+    id: "concentration",
+    label: "Flow concentration (fan-in/out)",
     impact: 0,
     details: {},
   };
 
-  const score = Math.max(0, Math.min(100, baseScore + rawContribution));
+  const governanceImpact = 0;
+  parts.governance = {
+    id: "governance",
+    label: "Governance / override",
+    impact: governanceImpact,
+    details: {},
+  };
 
-  const reasons = [];
-  const risk_factors = [];
+  const rawContribution =
+    ageImpact +
+    velImpact +
+    mixImpact +
+    neighborImpact +
+    dormantImpact +
+    listsImpact +
+    governanceImpact;
 
-  if (ageImpact > 0) { reasons.push('Wallet age'); risk_factors.push('Wallet age'); }
-  if (velImpact > 0) { reasons.push('Transaction velocity & bursts'); risk_factors.push('Transaction velocity & bursts'); }
-  if (mixImpact > 0) { reasons.push('Counterparty mix & concentration'); risk_factors.push('Counterparty mix & concentration'); }
-  if (neighborImpact > 0) { reasons.push('Neighbor & cluster risk'); risk_factors.push('Neighbor & cluster risk'); }
-  if (listsImpact > 0) { reasons.push('OFAC / sanctions list match'); risk_factors.push('OFAC / sanctions list match'); }
+  let score = clamp(baseScore + rawContribution, 0, 100);
+
+  const signals = {
+    ofacHit,
+    chainabuse: false,
+    caFraud: false,
+    scamPlatform: !!listDetails.scamCluster,
+    mixer: !!listDetails.tornado,
+    custodian: false,
+    unifiedSanctions: null,
+    chainalysis: null,
+    scorechain: null,
+  };
 
   const explain = {
-    version: 'RXL-V1.6.4',
+    version: VERSION,
     address: addr,
     network,
     baseScore,
@@ -542,130 +469,175 @@ function runRiskModel(address, network, txs, neighborCtx, lists) {
     confidence: 1,
     parts,
     feats,
-    signals: {
-      ofacHit: !!listDetails.ofac,
-      chainabuse: false,
-      caFraud: false,
-      scamPlatform: !!listDetails.scamCluster,
-      mixer: !!listDetails.tornado,
-      custodian: false,
-      unifiedSanctions: null,
-      chainalysis: null,
-      scorechain: null,
-    },
-    notes: [],
+    signals,
+    notes,
   };
+
+  // Flags for UI badges / narrative
+  explain.ofacHit = ofacHit;
+  explain.mixerLink = !!listDetails.tornado;
+  explain.scamHit = !!listDetails.scamCluster;
+  explain.sketchyCluster = !!listDetails.scamCluster;
+
+  explain.factorImpacts = [
+    { id: "age", label: "Wallet age", delta: ageImpact },
+    {
+      id: "velocity",
+      label: "Transaction velocity & bursts",
+      delta: velImpact,
+    },
+    {
+      id: "mix",
+      label: "Counterparty mix & concentration",
+      delta: mixImpact,
+    },
+    {
+      id: "neighbor",
+      label: "Neighbor & cluster risk",
+      delta: neighborImpact,
+    },
+    {
+      id: "dormant",
+      label: "Dormancy & resurrection patterns",
+      delta: dormantImpact,
+    },
+    {
+      id: "lists",
+      label: "External fraud & platform signals",
+      delta: listsImpact,
+    },
+  ];
+
+  const reasons = [];
+  if (ageImpact > 0) reasons.push("Wallet age");
+  if (velImpact > 0) reasons.push("Transaction velocity & bursts");
+  if (mixImpact > 0) reasons.push("Counterparty mix & concentration");
+  if (neighborImpact > 0) reasons.push("Neighbor & cluster risk");
+  if (listsImpact > 0 && ofacHit) reasons.push("OFAC / sanctions list match");
+  if (listsImpact > 0 && listDetails.scamCluster && !ofacHit)
+    reasons.push("Sketchy / scam cluster pattern");
+  if (listsImpact > 0 && listDetails.tornado && !ofacHit)
+    reasons.push("Mixer proximity pattern");
+
+  const block = !!(ofacHit || score >= 95);
+  const sanctionHits = ofacHit ? 1 : 0;
 
   return {
     address: addr,
     network,
     risk_score: score,
-    score,
     reasons,
-    risk_factors,
+    risk_factors: reasons,
     block,
     sanctionHits,
     feats,
     explain,
+    score,
   };
 }
 
-/* ========================= ROUTES =============================== */
+/* ========= Neighbors graph ========= */
 
-async function handleScore(url, env) {
-  const address = url.searchParams.get('address');
-  const network = url.searchParams.get('network') || 'eth';
+function buildNeighborGraph(address, txs, network, limit = 120) {
+  const addr = address.toLowerCase();
+  const cpCounts = new Map();
 
-  const addr = normHex(address);
-  if (!addr) {
-    return json({ ok: false, error: 'Missing or invalid address' }, 400);
+  for (const tx of txs) {
+    const from = tx.from?.toLowerCase();
+    const to = tx.to?.toLowerCase();
+    let other = null;
+    if (from === addr && to && to !== addr) other = to;
+    else if (to === addr && from && from !== addr) other = from;
+    if (other) cpCounts.set(other, (cpCounts.get(other) || 0) + 1);
   }
 
-  const lists = {
-    ofacSet: parseHexSet(env.OFAC_SET),
-    scamSet: parseHexSet(env.SCAM_CLUSTERS),
-    tornadoSet: parseHexSet(env.TORNADO_SET),
-  };
+  const nodes = [{ id: addr, address: addr, network }];
+  const links = [];
 
-  const { provider, txs } = await fetchTxHistoryHybrid(addr, network, env);
-  const neighborCtx = buildNeighborStats(addr, txs, lists);
+  const entries = [...cpCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit);
 
-  const scored = runRiskModel(addr, network, txs, neighborCtx, lists);
-  return json(scored);
-}
-
-async function handleNeighbors(url, env) {
-  const address = url.searchParams.get('address');
-  const network = url.searchParams.get('network') || 'eth';
-  const hop = Number(url.searchParams.get('hop') || '1') || 1;
-  const limit = Number(url.searchParams.get('limit') || '120') || 120;
-
-  const addr = normHex(address);
-  if (!addr) {
-    return json({ ok: false, error: 'Missing or invalid address' }, 400);
+  for (const [cp, weight] of entries) {
+    nodes.push({ id: cp, address: cp, network });
+    links.push({ a: addr, b: cp, weight });
   }
 
-  const lists = {
-    ofacSet: parseHexSet(env.OFAC_SET),
-    scamSet: parseHexSet(env.SCAM_CLUSTERS),
-    tornadoSet: parseHexSet(env.TORNADO_SET),
-  };
-
-  const { provider, txs } = await fetchTxHistoryHybrid(addr, network, env);
-  const neighborCtx = buildNeighborStats(addr, txs, lists);
-
-  const neighbors = neighborCtx.neighbors;
-  const capped = neighbors.slice(0, Math.max(1, limit | 0));
-
-  const nodes = [
-    { id: addr, address: addr, network },
-    ...capped.map((n) => ({ id: n, address: n, network })),
-  ];
-
-  const links = capped.map((n) => ({
-    a: addr,
-    b: n,
-    weight: neighborCtx.counts.get(n) || 1,
-  }));
-
-  return json({ nodes, links, provider, totalNeighbors: neighbors.length });
+  if (nodes.length === 1) {
+    // sparse – only center
+    return { nodes, links };
+  }
+  return { nodes, links };
 }
 
-/* ============ Debug routes (optional, but handy) ================= */
+/* ========= Fetch handler ========= */
 
-async function handleTxDebug(url, env) {
-  const address = url.searchParams.get('address');
-  const network = url.searchParams.get('network') || 'eth';
-  const addr = normHex(address);
-  if (!addr) return json({ ok: false, error: 'Missing or invalid address' }, 400);
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const { pathname, searchParams } = url;
 
-  const { provider, txs } = await fetchTxHistoryHybrid(addr, network, env);
-  return json({ ok: true, provider, count: txs.length, sample: txs.slice(0, 25) });
-}
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-headers": "Content-Type",
+          "access-control-allow-methods": "GET,OPTIONS",
+        },
+      });
+    }
 
-async function handleNeighborsDebug(url, env) {
-  const address = url.searchParams.get('address');
-  const network = url.searchParams.get('network') || 'eth';
-  const addr = normHex(address);
-  if (!addr) return json({ ok: false, error: 'Missing or invalid address' }, 400);
+    if (request.method !== "GET") {
+      return badRequest("Only GET supported");
+    }
 
-  const lists = {
-    ofacSet: parseHexSet(env.OFAC_SET),
-    scamSet: parseHexSet(env.SCAM_CLUSTERS),
-    tornadoSet: parseHexSet(env.TORNADO_SET),
-  };
+    const lists = {
+      ofacSet: parseHexSet(env.OFAC_SET),
+      scamSet: parseHexSet(env.SCAM_CLUSTERS),
+      tornadoSet: parseHexSet(env.TORNADO_SET),
+    };
 
-  const { provider, txs } = await fetchTxHistoryHybrid(addr, network, env);
-  const neighborCtx = buildNeighborStats(addr, txs, lists);
+    if (pathname === "/tx-debug") {
+      const address = searchParams.get("address")?.toLowerCase();
+      if (!address || !address.startsWith("0x")) {
+        return badRequest("Missing or invalid address");
+      }
+      const hist = await fetchTxHistory(address, env);
+      return json(hist);
+    }
 
-  return json({
-    ok: true,
-    provider,
-    neighborCount: neighborCtx.featsLocal.neighborCount,
-    sanctionedNeighbors: neighborCtx.sanctionedNeighbors,
-    mixerNeighbors: neighborCtx.mixerNeighbors,
-    scamNeighbors: neighborCtx.scamNeighbors,
-    featsLocal: neighborCtx.featsLocal,
-    neighbors: neighborCtx.neighbors.slice(0, 50),
-  });
-}
+    if (pathname === "/score") {
+      const address = searchParams.get("address")?.toLowerCase();
+      const network = (searchParams.get("network") || "eth").toLowerCase();
+
+      if (!address || !address.startsWith("0x")) {
+        return badRequest("Missing or invalid address");
+      }
+
+      const nowMs = Date.now();
+      const hist = await fetchTxHistory(address, env);
+      const feats = buildFeatures(address, hist.txs, nowMs);
+      const scored = scoreWithLists(address, network, feats, lists);
+
+      return json(scored);
+    }
+
+    if (pathname === "/neighbors") {
+      const address = searchParams.get("address")?.toLowerCase();
+      const network = (searchParams.get("network") || "eth").toLowerCase();
+      const limit = Number(searchParams.get("limit") || "120") || 120;
+
+      if (!address || !address.startsWith("0x")) {
+        return badRequest("Missing or invalid address");
+      }
+
+      const hist = await fetchTxHistory(address, env);
+      const graph = buildNeighborGraph(address, hist.txs, network, limit);
+      return json(graph);
+    }
+
+    return json({ ok: false, error: "Not found" }, 404);
+  },
+};
