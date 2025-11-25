@@ -1,243 +1,186 @@
-// server.worker.js — RiskXLabs Vision API v1.6.3
-// Cloudflare Worker: core risk engine + neighbors + CORS
+// workers/server.worker.js
+// RiskXLabs Vision API — Cloudflare Worker backend
+//
+// Routes:
+//   GET /score?address=0x...&network=eth        → risk score + explain + feats
+//   GET /neighbors?address=0x...&network=eth    → neighbor graph (1-hop)
+//   GET /tx-debug?address=0x...&network=eth     → raw tx debug
+//   GET /neighbors-debug?address=0x...&network=eth → neighbor graph debug
+//
+// Uses Cloudflare secrets / vars:
+//   ALCHEMY_API_KEY            (reserved for future use)
+//   ETHERSCAN_API_KEY
+//   CHAINALYSIS_SANCTIONS_API  (reserved)
+//   SCORECHAIN_API_KEY         (reserved)
+//   OFACLIST                   (not used directly here)
+//   OFAC_SET
+//   SCAM_CLUSTERS
+//   TORNADO_SET
 
-const SERVICE_NAME = 'riskxlabs-vision-api';
-const VERSION = 'RXL-V1.6.3';
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-/* =================== CORS helpers =================== */
+/* =================== Utility helpers =================== */
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*', // tighten later to your prod origin
-  'Access-Control-Allow-Methods': 'GET,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With'
-};
+function clamp(x, a = 0, b = 1) {
+  return Math.max(a, Math.min(b, x));
+}
 
-function jsonResponse(body, status = 200, extraHeaders = {}) {
+function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      ...CORS_HEADERS,
-      ...extraHeaders
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,OPTIONS',
+      'access-control-allow-headers': 'Content-Type,Origin,Accept'
     }
   });
 }
 
-function textResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(body, {
-    status,
-    headers: {
-      ...CORS_HEADERS,
-      ...extraHeaders
-    }
-  });
-}
-
-/* =================== Utils =================== */
-
-function clamp(x, min = 0, max = 1) {
-  return Math.max(min, Math.min(max, x));
-}
-
-function parseHexSet(str) {
-  const set = new Set();
-  if (!str || typeof str !== 'string') return set;
-  const parts = str.split(/[\s,;]+/);
-  for (let p of parts) {
-    if (!p) continue;
-    p = p.trim().toLowerCase();
-    if (!p) continue;
-    if (!p.startsWith('0x')) p = '0x' + p;
-    if (p.length === 42) set.add(p);
+function parseHexSet(raw) {
+  if (!raw || typeof raw !== 'string') return new Set();
+  let arr;
+  const trimmed = raw.trim();
+  if (!trimmed) return new Set();
+  if (trimmed[0] === '[') {
+    try { arr = JSON.parse(trimmed); } catch { arr = []; }
+  } else {
+    arr = trimmed.split(/[\s,]+/);
   }
-  return set;
+  const out = new Set();
+  for (let v of arr) {
+    if (!v) continue;
+    v = String(v).trim().toLowerCase();
+    if (!v) continue;
+    if (!v.startsWith('0x')) v = '0x' + v.replace(/^0x/i, '');
+    out.add(v);
+  }
+  return out;
 }
 
-function nowMs() {
-  return Date.now();
-}
+/* =================== Etherscan TX history =================== */
 
-/* =================== TX providers =================== */
+const ETHERSCAN_BASE = {
+  eth: 'https://api.etherscan.io',
+  polygon: 'https://api.polygonscan.com',
+  arbitrum: 'https://api.arbiscan.io'
+};
 
-async function fetchEtherscanTxs(address, network, env) {
-  const key = env.ETHERSCAN_API_KEY;
-  if (!key) throw new Error('ETHERSCAN_API_KEY not set');
+// Simple in-memory cache (best-effort)
+const txCache = new Map(); // key -> { ts, data }
+const TX_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-  // NOTE: Only mainnet eth is wired for now
-  if (network !== 'eth' && network !== 'ethereum') {
-    throw new Error(`Etherscan only configured for eth, got ${network}`);
+async function fetchEtherscanTxs(address, network, etherscanKey) {
+  if (!etherscanKey) {
+    return { ok: false, error: 'no etherscan key', provider: 'etherscan', txs: [] };
   }
 
-  const url = `https://api.etherscan.io/api` +
-    `?module=account&action=txlist` +
-    `&address=${encodeURIComponent(address)}` +
-    `&startblock=0&endblock=99999999&sort=asc` +
-    `&apikey=${encodeURIComponent(key)}`;
+  const key = `${network}:${address}`;
+  const now = Date.now();
+  const cached = txCache.get(key);
+  if (cached && (now - cached.ts) < TX_CACHE_TTL) {
+    return { ok: true, provider: 'etherscan-cache', txs: cached.data };
+  }
+
+  const base = ETHERSCAN_BASE[network] || ETHERSCAN_BASE.eth;
+  const url = `${base}/api?module=account&action=txlist&address=${encodeURIComponent(address)}&startblock=0&endblock=99999999&sort=asc&apikey=${encodeURIComponent(etherscanKey)}`;
 
   const resp = await fetch(url);
   if (!resp.ok) {
-    throw new Error(`Etherscan HTTP ${resp.status}`);
+    return { ok: false, error: `etherscan status ${resp.status}`, provider: 'etherscan', txs: [] };
   }
   const json = await resp.json();
   if (json.status !== '1' || !Array.isArray(json.result)) {
-    throw new Error(`Etherscan status ${json.status || '0'}`);
-  }
-  return { provider: 'etherscan', txs: json.result };
-}
-
-// Placeholder for future use; currently not used for scoring
-async function fetchAlchemyTxs(_address, _network, env) {
-  const key = env.ALCHEMY_API_KEY;
-  if (!key) throw new Error('ALCHEMY_API_KEY not set');
-  // Implementing full address-level tx fetch via Alchemy is non-trivial;
-  // for now we treat this as "not yet available" and let the caller fall
-  // through to synthetic behavior.
-  throw new Error('Alchemy tx provider not implemented');
-}
-
-async function loadTxs(address, network, env, { wantDebug = false } = {}) {
-  const debug = {
-    ok: false,
-    error: null,
-    provider: null,
-    raw: null
-  };
-
-  // Try providers in order
-  const providers = [fetchEtherscanTxs, fetchAlchemyTxs];
-
-  for (const fn of providers) {
-    try {
-      const { provider, txs } = await fn(address, network, env);
-      debug.ok = true;
-      debug.provider = provider;
-      debug.raw = txs;
-      return wantDebug ? { txs, debug } : { txs };
-    } catch (err) {
-      // continue to next provider
-      if (!debug.error) debug.error = String(err.message || err);
-    }
+    return { ok: false, error: `etherscan status ${json.status}`, provider: 'etherscan', txs: [] };
   }
 
-  // If we get here, no provider succeeded → synthetic fallback
-  const synthetic = [{
-    timeStamp: String(Math.floor(nowMs() / 1000)),
+  const txs = json.result.map(tx => ({
+    hash: tx.hash,
+    from: String(tx.from || '').toLowerCase(),
+    to: String(tx.to || '').toLowerCase(),
+    value: tx.value || '0',
+    timeStampMs: Number(tx.timeStamp || 0) * 1000
+  }));
+
+  txCache.set(key, { ts: now, data: txs });
+
+  return { ok: true, provider: 'etherscan', txs };
+}
+
+function syntheticTx(address) {
+  const now = Date.now();
+  return [{
     hash: '0xsynthetic',
     from: address,
     to: address,
-    value: '0'
+    value: '0',
+    timeStampMs: now - 365 * DAY_MS
   }];
-
-  debug.ok = false;
-  debug.provider = null;
-  debug.raw = synthetic;
-
-  return wantDebug
-    ? { txs: synthetic, debug }
-    : { txs: synthetic };
 }
 
 /* =================== Feature extraction =================== */
 
-function deriveFeatures(address, allTxs) {
+function deriveFeaturesFromTx(address, txs, nowMs) {
   const addr = address.toLowerCase();
+  const list = (Array.isArray(txs) && txs.length) ? [...txs] : syntheticTx(addr);
 
-  if (!Array.isArray(allTxs) || allTxs.length === 0) {
-    // Conservative neutral-ish defaults
-    return {
-      ageDays: 365,
-      firstSeenMs: null,
-      txCount: 0,
-      activeDays: 0,
-      txPerDay: 0,
-      burstScore: 0,
-      uniqueCounterparties: 0,
-      topCounterpartyShare: 0,
-      isDormant: false,
-      dormantDays: 0,
-      resurrectedRecently: false,
-      neighborCount: 0,
-      sanctionedNeighborRatio: 0,
-      highRiskNeighborRatio: 0,
-      dormantNeighborRatio: 0,
-      mixerProximity: 0,
-      custodianExposure: 0,
-      scamPlatformExposure: 0,
-      local: {
-        riskyNeighborRatio: 0,
-        neighborAvgTx: 0,
-        neighborAvgAgeDays: 0,
-        neighborCount: 0
-      }
-    };
+  list.sort((a, b) => (a.timeStampMs || 0) - (b.timeStampMs || 0));
+
+  const firstSeenMs = list[0].timeStampMs || nowMs;
+  const lastSeenMs = list[list.length - 1].timeStampMs || nowMs;
+
+  let ageDays = (nowMs - firstSeenMs) / DAY_MS;
+  if (ageDays < 0) ageDays = 0;
+
+  const dayMap = new Map();
+  const counterpartCounts = new Map();
+  const neighbors = new Set();
+
+  for (const tx of list) {
+    const ts = tx.timeStampMs || nowMs;
+    const dayKey = Math.floor(ts / DAY_MS);
+    dayMap.set(dayKey, (dayMap.get(dayKey) || 0) + 1);
+
+    const from = tx.from?.toLowerCase?.() || '';
+    const to = tx.to?.toLowerCase?.() || '';
+
+    const other = (from === addr ? to : (to === addr ? from : null));
+    if (other && other !== addr) {
+      neighbors.add(other);
+      counterpartCounts.set(other, (counterpartCounts.get(other) || 0) + 1);
+    }
   }
 
-  const txs = allTxs.slice().sort((a, b) => {
-    const ta = Number(a.timeStamp || 0);
-    const tb = Number(b.timeStamp || 0);
-    return ta - tb;
-  });
+  const txCount = list.length;
+  const activeDays = dayMap.size || 1;
+  const txPerDay = txCount / activeDays;
 
-  const now = nowMs();
-  const firstTsMs = Number(txs[0].timeStamp || 0) * 1000 || now;
-  const lastTsMs = Number(txs[txs.length - 1].timeStamp || 0) * 1000 || now;
+  let maxPerDay = 0;
+  for (const c of dayMap.values()) if (c > maxPerDay) maxPerDay = c;
+  const burstScoreRaw = maxPerDay / (txPerDay || 1);
+  const burstScore = clamp((burstScoreRaw - 1) / 9);
 
-  const ageDays = Math.max(0, (now - firstTsMs) / 86400000);
-  const spanDays = Math.max(1, (lastTsMs - firstTsMs) / 86400000);
-  const txCount = txs.length;
-  const txPerDay = txCount / spanDays;
-
-  // simple burst metric: relative to linear baseline
-  let maxDaily = 0;
-  const byDay = new Map();
-  for (const tx of txs) {
-    const d = Math.floor(Number(tx.timeStamp || 0) / 86400);
-    byDay.set(d, (byDay.get(d) || 0) + 1);
-  }
-  byDay.forEach(v => { if (v > maxDaily) maxDaily = v; });
-  const burstScore = clamp(maxDaily / Math.max(1, txPerDay * 2));
-
-  // counterparties
-  const cpCounts = new Map();
-  for (const tx of txs) {
-    const from = String(tx.from || '').toLowerCase();
-    const to = String(tx.to || '').toLowerCase();
-    let cp = null;
-    if (from === addr && to) cp = to;
-    else if (to === addr && from) cp = from;
-    if (!cp) continue;
-    cpCounts.set(cp, (cpCounts.get(cp) || 0) + 1);
-  }
-  const uniqueCounterparties = cpCounts.size;
+  let uniqueCounterparties = neighbors.size;
   let topCounterpartyShare = 0;
-  if (txCount > 0 && uniqueCounterparties > 0) {
-    let maxCount = 0;
-    cpCounts.forEach(v => { if (v > maxCount) maxCount = v; });
-    topCounterpartyShare = maxCount / txCount;
+  if (txCount > 0 && counterpartCounts.size) {
+    let max = 0;
+    for (const c of counterpartCounts.values()) if (c > max) max = c;
+    topCounterpartyShare = max / txCount;
   }
-
-  // simple dormancy flags
-  const inactiveThresholdDays = 45;
-  const dormantDays = Math.max(0, (now - lastTsMs) / 86400000);
-  const isDormant = dormantDays >= inactiveThresholdDays;
-  const resurrectedRecently = !isDormant && dormantDays <= 7 && ageDays > 90;
-
-  // neighbor metrics filled later where we have list sets; defaults here:
-  const neighborCount = uniqueCounterparties;
 
   return {
     ageDays,
-    firstSeenMs: firstTsMs,
+    firstSeenMs,
     txCount,
-    activeDays: spanDays,
+    activeDays,
     txPerDay,
     burstScore,
     uniqueCounterparties,
     topCounterpartyShare,
-    isDormant,
-    dormantDays,
-    resurrectedRecently,
-    neighborCount,
+    isDormant: false,
+    dormantDays: (nowMs - lastSeenMs) / DAY_MS,
+    resurrectedRecently: false,
+    neighborCount: neighbors.size,
     sanctionedNeighborRatio: 0,
     highRiskNeighborRatio: 0,
     dormantNeighborRatio: 0,
@@ -248,49 +191,29 @@ function deriveFeatures(address, allTxs) {
       riskyNeighborRatio: 0,
       neighborAvgTx: txPerDay,
       neighborAvgAgeDays: ageDays,
-      neighborCount
+      neighborCount: neighbors.size
     }
   };
 }
 
-/* =================== Risk model =================== */
+/* =================== Scoring =================== */
 
-function scoreWithModel(address, network, feats, sets) {
-  const { ofacSet, scamSet, tornadoSet } = sets;
-
-  const addr = address.toLowerCase();
-  const ageDays = feats.ageDays ?? 0;
-  const txPerDay = feats.txPerDay ?? 0;
-  const uniq = feats.uniqueCounterparties ?? 0;
-  const topShare = feats.topCounterpartyShare ?? 0;
-
-  const ofacHit = ofacSet.has(addr);
-  const inScam = scamSet.has(addr);
-  const inTornado = tornadoSet.has(addr);
-
+function scoreFromFeatures(address, feats, signals, network) {
+  const parts = {};
   let baseScore = 15;
   let rawContribution = 0;
 
-  const parts = {};
-
-  // Age
+  const ageDays = feats.ageDays ?? 0;
   let ageImpact = 0;
-  let ageBucket = '> 2y';
+  let ageBucket;
   if (ageDays < 7) {
-    ageImpact = 25;
-    ageBucket = '< 1 week';
-  } else if (ageDays < 30) {
-    ageImpact = 18;
-    ageBucket = '< 1 month';
+    ageImpact = 25; ageBucket = '< 1 week';
   } else if (ageDays < 180) {
-    ageImpact = 8;
-    ageBucket = '1–6m';
-  } else if (ageDays < 730) {
-    ageImpact = 2;
-    ageBucket = '6m–2y';
+    ageImpact = 10; ageBucket = '< 6 months';
+  } else if (ageDays < 365 * 2) {
+    ageImpact = 2; ageBucket = '6m–2y';
   } else {
-    ageImpact = -5;
-    ageBucket = '> 2y';
+    ageImpact = -5; ageBucket = '> 2 years';
   }
   rawContribution += ageImpact;
   parts.age = {
@@ -300,119 +223,100 @@ function scoreWithModel(address, network, feats, sets) {
     details: { ageDays, bucket: ageBucket }
   };
 
-  // Velocity
-  let vImpact = 0;
-  let vBucket = 'normal';
-  if (txPerDay > 50) {
-    vImpact = 22;
-    vBucket = 'extreme';
-  } else if (txPerDay > 10) {
-    vImpact = 15;
-    vBucket = 'high';
-  } else if (txPerDay > 3) {
-    vImpact = 10;
-    vBucket = 'elevated';
-  } else if (txPerDay > 0.5) {
-    vImpact = 4;
-    vBucket = 'mild';
+  const txPerDay = feats.txPerDay ?? 0;
+  const burstScore = feats.burstScore ?? 0;
+  let velImpact = 0;
+  let velBucket = 'normal';
+  if (txPerDay > 50 || burstScore > 0.9) {
+    velImpact = 25; velBucket = 'extreme';
+  } else if (txPerDay > 10 || burstScore > 0.7) {
+    velImpact = 15; velBucket = 'elevated';
+  } else if (txPerDay > 3 || burstScore > 0.5) {
+    velImpact = 5; velBucket = 'mild';
   }
-  rawContribution += vImpact;
+  rawContribution += velImpact;
   parts.velocity = {
     id: 'velocity',
     label: 'Transaction velocity & bursts',
-    impact: vImpact,
-    details: { txPerDay, burstScore: feats.burstScore ?? 0, bucket: vBucket }
+    impact: velImpact,
+    details: { txPerDay, burstScore, bucket: velBucket }
   };
 
-  // Mix / concentration
+  const uniq = feats.uniqueCounterparties ?? 0;
+  const topShare = feats.topCounterpartyShare ?? 0;
   let mixImpact = 0;
   let mixBucket = 'diversified';
-  if (uniq <= 1 || topShare > 0.8) {
-    mixImpact = 14;
-    mixBucket = 'concentrated';
-  } else if (uniq <= 3 || topShare > 0.5) {
-    mixImpact = 8;
-    mixBucket = 'moderate';
-  } else if (uniq > 20 && topShare < 0.2) {
-    mixImpact = -2;
-    mixBucket = 'very diversified';
+  if (uniq <= 1 && topShare >= 0.9) {
+    mixImpact = 14; mixBucket = 'concentrated';
+  } else if (uniq < 4 && topShare >= 0.6) {
+    mixImpact = 8; mixBucket = 'semi-concentrated';
+  } else if (uniq > 25 && topShare < 0.2) {
+    mixImpact = -2; mixBucket = 'diversified';
   }
   rawContribution += mixImpact;
   parts.mix = {
     id: 'mix',
     label: 'Counterparty mix & concentration',
     impact: mixImpact,
-    details: {
-      uniqueCounterparties: uniq,
-      topCounterpartyShare: topShare,
-      bucket: mixBucket
-    }
+    details: { uniqueCounterparties: uniq, topCounterpartyShare: topShare, bucket: mixBucket }
   };
 
-  // Neighbor risk (here we just use scam/tornado membership as a proxy)
+  const neighborCount = feats.neighborCount ?? feats.local?.neighborCount ?? 0;
   let neighborImpact = 0;
-  const neighborCount = feats.neighborCount ?? feats.local?.neighborCount ?? uniq ?? 0;
-  const sanctionedNeighborRatio = feats.sanctionedNeighborRatio ?? 0;
-  const highRiskNeighborRatio = feats.highRiskNeighborRatio ?? 0;
-
-  if (sanctionedNeighborRatio > 0.1 || highRiskNeighborRatio > 0.3) {
-    neighborImpact = 15;
-  } else if (highRiskNeighborRatio > 0.1) {
-    neighborImpact = 8;
-  }
-  rawContribution += neighborImpact;
+  if (neighborCount > 40) neighborImpact = 5;
   parts.neighbor = {
     id: 'neighbor',
     label: 'Neighbor & cluster risk',
     impact: neighborImpact,
     details: {
       neighborCount,
-      sanctionedNeighborRatio,
-      highRiskNeighborRatio,
-      mixedCluster: neighborImpact > 0
+      sanctionedNeighborRatio: feats.sanctionedNeighborRatio ?? 0,
+      highRiskNeighborRatio: feats.highRiskNeighborRatio ?? 0,
+      mixedCluster: neighborCount > 0
     }
   };
+  rawContribution += neighborImpact;
 
-  // Lists (OFAC, scam, tornado)
-  let listImpact = 0;
+  let listsImpact = 0;
   const listDetails = {};
-  if (ofacHit) {
-    listImpact += 70;
+  if (signals.ofacHit) {
+    listsImpact += 70;
     listDetails.ofac = true;
   }
-  if (inScam) {
-    listImpact += 30;
+  if (signals.mixer) {
+    listsImpact += 35;
+    listDetails.mixer = true;
+  }
+  if (signals.scamCluster) {
+    listsImpact += 30;
     listDetails.scamCluster = true;
   }
-  if (inTornado) {
-    listImpact += 25;
-    listDetails.tornado = true;
-  }
-  rawContribution += listImpact;
   parts.lists = {
     id: 'lists',
     label: 'External fraud & platform signals',
-    impact: listImpact,
+    impact: listsImpact,
     details: listDetails
   };
+  rawContribution += listsImpact;
 
-  // dormant / governance placeholders
   parts.dormant = {
     id: 'dormant',
     label: 'Dormancy & resurrection patterns',
     impact: 0,
     details: {
-      isDormant: feats.isDormant ?? false,
-      dormantDays: feats.dormantDays ?? 0,
-      resurrectedRecently: feats.resurrectedRecently ?? false
+      isDormant: feats.isDormant || false,
+      dormantDays: feats.dormantDays || 0,
+      resurrectedRecently: feats.resurrectedRecently || false
     }
   };
+
   parts.concentration = {
     id: 'concentration',
     label: 'Flow concentration (fan-in/out)',
     impact: 0,
     details: {}
   };
+
   parts.governance = {
     id: 'governance',
     label: 'Governance / override',
@@ -420,26 +324,22 @@ function scoreWithModel(address, network, feats, sets) {
     details: {}
   };
 
-  let score = clamp(baseScore + rawContribution, 0, 100);
+  let score = baseScore + rawContribution;
 
-  // Force minimum score for OFAC
-  if (ofacHit && score < 87) score = 87;
+  if (signals.ofacHit) {
+    score = 100;
+  } else if (signals.mixer && signals.scamCluster) {
+    score = Math.max(score, 90);
+  } else if (signals.mixer || signals.scamCluster) {
+    score = Math.max(score, 80);
+  }
 
-  const reasons = [];
-  const risk_factors = [];
-
-  if (ageImpact > 0) { reasons.push('Wallet age'); risk_factors.push('Wallet age'); }
-  if (vImpact > 0) { reasons.push('Transaction velocity & bursts'); risk_factors.push('Transaction velocity & bursts'); }
-  if (mixImpact > 0) { reasons.push('Counterparty mix & concentration'); risk_factors.push('Counterparty mix & concentration'); }
-  if (neighborImpact > 0) { reasons.push('Neighbor & cluster risk'); risk_factors.push('Neighbor & cluster risk'); }
-  if (listImpact > 0) { reasons.push('OFAC / sanctions list match'); risk_factors.push('OFAC / sanctions list match'); }
-
-  const sanctionHits = ofacHit ? 1 : 0;
-  const block = !!(ofacHit || score >= 90);
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const block = !!(signals.ofacHit || score >= 90);
 
   const explain = {
-    version: VERSION,
-    address: addr,
+    version: 'RXL-V1.6.3',
+    address,
     network,
     baseScore,
     rawContribution,
@@ -447,191 +347,174 @@ function scoreWithModel(address, network, feats, sets) {
     confidence: 1,
     parts,
     feats,
-    signals: {
-      ofacHit,
-      chainabuse: false,
-      caFraud: false,
-      scamPlatform: inScam,
-      mixer: inTornado,
-      custodian: false,
-      unifiedSanctions: null,
-      chainalysis: null,
-      scorechain: null
-    },
+    signals,
     notes: []
   };
+
+  return { score, block, explain };
+}
+
+/* =================== Risk response + neighbors =================== */
+
+async function buildRiskResponse(address, network, env) {
+  const addr = address.toLowerCase();
+  const nowMs = Date.now();
+
+  const ofacSet = parseHexSet(env.OFAC_SET);
+  const scamSet = parseHexSet(env.SCAM_CLUSTERS);
+  const tornadoSet = parseHexSet(env.TORNADO_SET);
+
+  const { ok, provider, txs, error } =
+    await fetchEtherscanTxs(addr, network, env.ETHERSCAN_API_KEY)
+      .catch(err => ({ ok: false, error: String(err), provider: 'etherscan', txs: [] }));
+
+  const txList = ok ? txs : syntheticTx(addr);
+  const feats = deriveFeaturesFromTx(addr, txList, nowMs);
+
+  const ofacHit = ofacSet.has(addr);
+  const mixerHit = tornadoSet.has(addr);
+  const scamClusterHit = scamSet.has(addr);
+
+  feats.mixerProximity = mixerHit ? 1 : 0;
+  feats.scamPlatformExposure = scamClusterHit ? 1 : 0;
+
+  const signals = {
+    ofacHit,
+    chainabuse: false,
+    caFraud: false,
+    scamPlatform: scamClusterHit,
+    mixer: mixerHit,
+    custodian: false,
+    unifiedSanctions: null,
+    chainalysis: null,
+    scorechain: null
+  };
+
+  const { score, block, explain } = scoreFromFeatures(addr, feats, signals, network);
+
+  const reasons = [];
+  if (explain.parts.age.impact !== 0) reasons.push('Wallet age');
+  if (explain.parts.velocity.impact !== 0) reasons.push('Transaction velocity & bursts');
+  if (explain.parts.mix.impact !== 0) reasons.push('Counterparty mix & concentration');
+  if (ofacHit) reasons.push('OFAC / sanctions list match');
+  if (mixerHit) reasons.push('Mixer proximity (Tornado)');
+  if (scamClusterHit) reasons.push('Sketchy cluster pattern');
 
   return {
     address: addr,
     network,
     risk_score: score,
     reasons,
-    risk_factors,
+    risk_factors: reasons,
     block,
-    sanctionHits,
+    sanctionHits: ofacHit ? 1 : 0,
     feats,
     explain,
     score
   };
 }
 
-/* =================== Neighbors from tx graph =================== */
+async function buildNeighborGraph(address, network, env, limit = 120) {
+  const addr = address.toLowerCase();
+  const { ok, txs } =
+    await fetchEtherscanTxs(addr, network, env.ETHERSCAN_API_KEY)
+      .catch(err => ({ ok: false, error: String(err), provider: 'etherscan', txs: [] }));
 
-function buildNeighborsFromTxs(address, allTxs, network, limit = 120) {
-  const center = address.toLowerCase();
-  const nodes = [{ id: center, address: center, network }];
+  const list = ok && txs.length ? txs : syntheticTx(addr);
+  const neighbors = new Map();
+
+  for (const tx of list) {
+    const from = tx.from?.toLowerCase?.() || '';
+    const to = tx.to?.toLowerCase?.() || '';
+    const other = (from === addr ? to : (to === addr ? from : null));
+    if (!other || other === addr) continue;
+    if (!neighbors.has(other)) {
+      neighbors.set(other, { id: other, address: other, network });
+    }
+  }
+
+  const nodes = [{ id: addr, address: addr, network }];
   const links = [];
-  const seen = new Set([center]);
 
-  for (const tx of allTxs) {
-    const from = String(tx.from || '').toLowerCase();
-    const to = String(tx.to || '').toLowerCase();
-    let cp = null;
-    if (from === center && to) cp = to;
-    else if (to === center && from) cp = from;
-    if (!cp) continue;
-    if (seen.has(cp)) continue;
-    seen.add(cp);
-    nodes.push({ id: cp, address: cp, network });
-    links.push({ a: center, b: cp, weight: 1 });
-    if (nodes.length - 1 >= limit) break;
+  const cap = Math.min(limit, neighbors.size);
+  let i = 0;
+  for (const [nid, node] of neighbors.entries()) {
+    if (i++ >= cap) break;
+    nodes.push(node);
+    links.push({ a: addr, b: nid, weight: 1 });
   }
 
   return { nodes, links };
 }
 
-/* =================== Worker entry =================== */
+/* =================== Worker entrypoint =================== */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const { pathname, searchParams } = url;
+    const path = url.pathname.replace(/\/+$/, '') || '/';
 
-    // CORS preflight
     if (request.method === 'OPTIONS') {
-      return textResponse('', 204);
-    }
-
-    // Root / health
-    if (pathname === '/' || pathname === '/health') {
-      return jsonResponse({
-        ok: true,
-        service: SERVICE_NAME,
-        version: VERSION,
-        time: new Date().toISOString()
+      return new Response('', {
+        status: 204,
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET,OPTIONS',
+          'access-control-allow-headers': 'Content-Type,Origin,Accept'
+        }
       });
     }
 
-    // /score
-    if (pathname === '/score') {
-      try {
-        const address = (searchParams.get('address') || '').toLowerCase();
-        const network = (searchParams.get('network') || 'eth').toLowerCase();
-        if (!address || !address.startsWith('0x')) {
+    try {
+      if (path === '/score') {
+        const address = (url.searchParams.get('address') || '').trim().toLowerCase();
+        const network = (url.searchParams.get('network') || 'eth').toLowerCase();
+        if (!address || !address.startsWith('0x') || address.length < 10) {
           return jsonResponse({ ok: false, error: 'Missing or invalid address' }, 400);
         }
-
-        const ofacSet = parseHexSet(env.OFAC_SET);
-        const scamSet = parseHexSet(env.SCAM_CLUSTERS);
-        const tornadoSet = parseHexSet(env.TORNADO_SET);
-
-        const { txs } = await loadTxs(address, network, env);
-        const feats = deriveFeatures(address, txs);
-        const result = scoreWithModel(address, network, feats, {
-          ofacSet,
-          scamSet,
-          tornadoSet
-        });
-
-        return jsonResponse(result);
-      } catch (err) {
-        return jsonResponse(
-          { ok: false, error: String(err.message || err) },
-          500
-        );
+        const res = await buildRiskResponse(address, network, env);
+        return jsonResponse(res, 200);
       }
-    }
 
-    // /txs-debug
-    if (pathname === '/txs-debug') {
-      try {
-        const address = (searchParams.get('address') || '').toLowerCase();
-        const network = (searchParams.get('network') || 'eth').toLowerCase();
-        if (!address || !address.startsWith('0x')) {
+      if (path === '/neighbors') {
+        const address = (url.searchParams.get('address') || '').trim().toLowerCase();
+        const network = (url.searchParams.get('network') || 'eth').toLowerCase();
+        const limit = Number(url.searchParams.get('limit') || '120') || 120;
+        if (!address || !address.startsWith('0x') || address.length < 10) {
           return jsonResponse({ ok: false, error: 'Missing or invalid address' }, 400);
         }
-
-        const { txs, debug } = await loadTxs(address, network, env, {
-          wantDebug: true
-        });
-
-        return jsonResponse({
-          ok: debug.ok,
-          error: debug.ok ? null : (debug.error || 'no providers succeeded; returning synthetic'),
-          provider: debug.provider,
-          raw: txs
-        });
-      } catch (err) {
-        return jsonResponse(
-          { ok: false, error: String(err.message || err) },
-          500
-        );
+        const graph = await buildNeighborGraph(address, network, env, limit);
+        return jsonResponse(graph, 200);
       }
-    }
 
-    // /neighbors
-    if (pathname === '/neighbors') {
-      try {
-        const address = (searchParams.get('address') || '').toLowerCase();
-        const network = (searchParams.get('network') || 'eth').toLowerCase();
-        const limit = Number(searchParams.get('limit') || '120') || 120;
-        if (!address || !address.startsWith('0x')) {
+      if (path === '/tx-debug') {
+        const address = (url.searchParams.get('address') || '').trim().toLowerCase();
+        const network = (url.searchParams.get('network') || 'eth').toLowerCase();
+        if (!address || !address.startsWith('0x') || address.length < 10) {
           return jsonResponse({ ok: false, error: 'Missing or invalid address' }, 400);
         }
-
-        const { txs } = await loadTxs(address, network, env);
-        const graph = buildNeighborsFromTxs(address, txs, network, limit);
-
-        return jsonResponse(graph);
-      } catch (err) {
-        return jsonResponse(
-          { ok: false, error: String(err.message || err) },
-          500
-        );
+        const resp = await fetchEtherscanTxs(address, network, env.ETHERSCAN_API_KEY)
+          .catch(err => ({ ok: false, error: String(err), provider: 'etherscan', txs: [] }));
+        if (!resp.ok) {
+          return jsonResponse({ ok: false, error: resp.error || 'no providers succeeded; returning synthetic', provider: null, raw: syntheticTx(address) });
+        }
+        return jsonResponse({ ok: true, provider: resp.provider, raw: resp.txs });
       }
-    }
 
-    // /neighbors-debug
-    if (pathname === '/neighbors-debug') {
-      try {
-        const address = (searchParams.get('address') || '').toLowerCase();
-        const network = (searchParams.get('network') || 'eth').toLowerCase();
-        const limit = Number(searchParams.get('limit') || '120') || 120;
-        if (!address || !address.startsWith('0x')) {
+      if (path === '/neighbors-debug') {
+        const address = (url.searchParams.get('address') || '').trim().toLowerCase();
+        const network = (url.searchParams.get('network') || 'eth').toLowerCase();
+        if (!address || !address.startsWith('0x') || address.length < 10) {
           return jsonResponse({ ok: false, error: 'Missing or invalid address' }, 400);
         }
-
-        const { txs, debug } = await loadTxs(address, network, env, {
-          wantDebug: true
-        });
-        const graph = buildNeighborsFromTxs(address, txs, network, limit);
-
-        return jsonResponse({
-          ok: true,
-          providerOk: debug.ok,
-          provider: debug.provider,
-          txSample: debug.raw?.slice?.(0, 5) || null,
-          graph
-        });
-      } catch (err) {
-        return jsonResponse(
-          { ok: false, error: String(err.message || err) },
-          500
-        );
+        const graph = await buildNeighborGraph(address, network, env, 120);
+        return jsonResponse(graph, 200);
       }
-    }
 
-    // Fallback 404
-    return jsonResponse({ ok: false, error: 'Not found' }, 404);
+      // Root or unknown path
+      return jsonResponse({ ok: false, error: 'Not found' }, 404);
+    } catch (err) {
+      return jsonResponse({ ok: false, error: String(err && err.message || err) }, 500);
+    }
   }
 };
