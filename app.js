@@ -4,7 +4,7 @@ console.log('[Vision] app.js loaded v1.6.2');
 
 import './ui/ScoreMeter.js?v=2025-11-15';     // window.ScoreMeter(...)
 import './graph.js?v=2025-11-15';             // window.graph (on/setData/getData/setHalo)
-import { colorForScore } from './lib/risk-colors.js';
+import { colorForScore, bandForScore } from './lib/risk-colors.js';
 import { applyFeatureTogglesFromUI } from './config.js';
 
 /* ================= Feature Flags & Graph Config ==================== */
@@ -80,6 +80,7 @@ worker.onmessage = (e) => {
 function normalizeResult(res = {}) {
   const id = normId(res.id || res.address);
 
+  // Prefer risk_score from backend; fall back to top-level score.
   const serverScore =
     typeof res.risk_score === 'number'
       ? res.risk_score
@@ -98,14 +99,17 @@ function normalizeResult(res = {}) {
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
+  // Ensure OFAC flag is set on explain
   coerceOfacFlag(explain, res);
 
+  // Force explain.score to match the final server score so the meter & narrative agree
   if (serverScore != null) {
     explain.score = serverScore;
   }
 
   const feats = res.feats || {};
 
+  // Wallet-age → normalized risk (younger = higher)
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(feats.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
@@ -113,6 +117,7 @@ function normalizeResult(res = {}) {
     }
   }
 
+  // Neighbor proxies
   const neighborCount =
     feats.local?.neighborCount ??
     feats.neighborCount ??
@@ -139,6 +144,14 @@ function normalizeResult(res = {}) {
       avgDays: Number(feats.local.neighborAvgAgeDays) || 0,
       n: neighborCount
     };
+  }
+
+  // Bubble up mixer/scam flags from signals for UI convenience
+  const sig = explain.signals || {};
+  if (sig.mixer && !explain.mixerLink) explain.mixerLink = true;
+  if (sig.scamPlatform && !explain.sketchyCluster) {
+    explain.sketchyCluster = true;
+    explain.scamHit = true;
   }
 
   return {
@@ -209,6 +222,7 @@ function bindUI() {
     scoreVisible();
   });
 
+  // Graph selection → score + neighbors + history
   if (window.graph && typeof window.graph.on === 'function') {
     window.graph.on('selectNode', (n) => {
       if (!n) return;
@@ -223,6 +237,7 @@ function bindUI() {
     });
   }
 
+  // Nav buttons
   document.getElementById('navBack')?.addEventListener('click', () => {
     if (navIndex > 0) {
       navIndex--;
@@ -248,6 +263,7 @@ function bindUI() {
     }
   });
 
+  // Narrative UI
   const modeSel = document.getElementById('rxlMode');
   if (modeSel) modeSel.addEventListener('change', () => lastRenderResult && renderNarrativePanelIfEnabled(lastRenderResult));
   const copyBtn = document.getElementById('rxlCopy');
@@ -255,6 +271,7 @@ function bindUI() {
   const exportBtn = document.getElementById('rxlExport');
   if (exportBtn) exportBtn.addEventListener('click', () => { flash(exportBtn, 'Queued'); });
 
+  // React to Control Panel toggles
   window.addEventListener('rxl:features:changed', () => {
     applyFeatureTogglesFromUI();
     if (lastRenderResult) {
@@ -293,9 +310,11 @@ function pushNav(id){
 async function centerOnSeedAndLoad(seed, opts = {}) {
   const network = getNetwork();
   setSelected(seed);
+  // Replace graph with centered node while loading neighbors
   setGraphData({ nodes:[{ id: seed, address: seed, network }], links:[] });
   setNeighborStatusLoading();
 
+  // Score
   post('SCORE_ONE', { item: { type:'address', id: seed, network } })
     .then(r => {
       const rr = normalizeResult(r);
@@ -305,6 +324,7 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
     })
     .catch(()=>{});
 
+  // Neighbors
   refreshGraphFromLive(seed).catch(()=>{
     setNeighborStatus('Neighbors: unavailable');
   });
@@ -318,10 +338,8 @@ async function centerOnSeedAndLoad(seed, opts = {}) {
 
 const FACTOR_WEIGHTS = {
   'OFAC': 40,
-  'OFAC / sanctions list match': 40,
+  'OFAC/sanctions list match': 40,
   'sanctioned Counterparty': 40,
-  'Mixer proximity': 35,
-  'Sketchy cluster pattern': 45,
   'fan In High': 9,
   'shortest Path To Sanctioned': 6,
   'burst Anomaly': 0,
@@ -554,6 +572,7 @@ function narrativeFromExplain(expl, mode = 'analyst') {
   }
 
   if (expl.mixerLink) parts.push('with adjacency to mixer infrastructure');
+  if (expl.sketchyCluster) parts.push('with links to a sketchy / scam cluster');
 
   let text = 'This wallet is ' + (parts.length ? parts.join(', ') : 'under assessment') + '.';
   if (!expl.ofacHit) text += ' No direct OFAC link was found.';
@@ -569,12 +588,16 @@ function narrativeFromExplain(expl, mode = 'analyst') {
 
   const badges = [];
   const push = (label, level='warn') => badges.push({ label, level });
-  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant Cluster', 'risk');
-  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) push('Young Wallet', 'warn');
-  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
-  if (expl.ofacHit) push('OFAC', 'risk'); else push('No OFAC', 'safe');
-  if (expl.mixerLink) push('Mixer proximity', 'risk');
-  if (expl.scamCluster) push('Sketchy cluster', 'risk');
+  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant cluster', 'risk');
+  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) push('Young wallet', 'warn');
+  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High counterparty volume', 'warn');
+
+  // NEW: Mixer & Sketchy Cluster badges
+  const sig = expl.signals || {};
+  if (expl.mixerLink || sig.mixer) push('Mixer proximity', 'warn');
+  if (expl.sketchyCluster || expl.scamHit || sig.scamPlatform) push('Sketchy cluster', 'risk');
+
+  push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
   const factors = Array.isArray(expl.factorImpacts)
     ? [...expl.factorImpacts].sort((a,b)=>(b.delta||0)-(a.delta||0)).slice(0,5)
@@ -600,6 +623,14 @@ function renderNarrativePanelIfEnabled(res) {
   if (typeof expl.walletAgeRisk !== 'number' && typeof res.feats?.ageDays === 'number') {
     const d = res.feats.ageDays;
     expl.walletAgeRisk = clamp(1 - Math.min(1, d / (365 * 2)));
+  }
+
+  // Also make sure badges can see mixer/scam flags even if they only exist in signals
+  const sig = expl.signals || {};
+  if (sig.mixer && !expl.mixerLink) expl.mixerLink = true;
+  if (sig.scamPlatform && !expl.sketchyCluster) {
+    expl.sketchyCluster = true;
+    expl.scamHit = true;
   }
 
   const modeSel = document.getElementById('rxlMode');
